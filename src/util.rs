@@ -5,7 +5,7 @@
 //!
 //! - **`canonical`** — combine forward and reverse‐complement hashes into a
 //!   strand‐independent value by wrapping addition.
-//! - **`extend_hashes`** — generate a sequence of “extra” hash values from
+//! - **`extend_hashes`** — generate a sequence of "extra" hash values from
 //!   one canonical base hash, matching the C++ reference’s multiplicative
 //!   mixing and shift scheme.
 //!

@@ -1,4 +1,4 @@
-use nthash::kmer::NtHashBuilder;
+use nthash_rs::kmer::NtHashBuilder;
 
 const SEQ: &str = "ATCGTACGATGCATGCATGCTGACG";
 const K: u16 = 6;

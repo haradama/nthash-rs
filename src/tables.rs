@@ -15,8 +15,8 @@ use crate::constants::{MS_TAB_31L, MS_TAB_33R};
 /// One‑bit split‑rotate left (33 + 31 bit halves).
 ///
 /// Conceptually, the 64‑bit word is split into:
-/// - a 33‑bit “upper” half (bits 32–63)
-/// - a 31‑bit “lower” half (bits 0–30)
+/// - a 33‑bit "upper" half (bits 32–63)
+/// - a 31‑bit "lower" half (bits 0–30)
 ///
 /// Each half is rotated left by one bit, exchanging carry bits:
 /// - bit 63 ➔ bit 33 (upper ➔ lower)
@@ -36,7 +36,7 @@ pub const fn srol(x: u64) -> u64 {
 ///
 /// This implements `d` repeated one‑bit split‑rotates efficiently:
 /// 1. Perform a full 64‑bit rotate left by `d`.
-/// 2. “Unscramble” any bits that crossed the 33/31 boundary to match
+/// 2. "Unscramble" any bits that crossed the 33/31 boundary to match
 ///    the effect of split‑rotating each half independently.
 #[inline(always)]
 pub const fn srol_n(x: u64, d: u32) -> u64 {

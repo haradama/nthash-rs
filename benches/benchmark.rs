@@ -1,7 +1,7 @@
 // benches/benchmark.rs
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use nthash::kmer::NtHashBuilder;
+use nthash_rs::kmer::NtHashBuilder;
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Generate a pseudo‐random DNA sequence of length `len` by

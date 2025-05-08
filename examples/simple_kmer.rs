@@ -1,4 +1,4 @@
-use nthash::{kmer::NtHashBuilder, NtHashError};
+use nthash_rs::{kmer::NtHashBuilder, NtHashError};
 
 fn main() -> Result<(), NtHashError> {
     let seq = "ATCGTACGATGCATGCATGCTGACG";
