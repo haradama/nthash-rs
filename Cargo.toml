@@ -1,0 +1,23 @@
+[package]
+name    = "nthash"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror   = "2.0.12"
+
+[dev-dependencies]
+criterion = "0.5.1"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level       = 3
+lto             = "fat"
+codegen-units   = 1
