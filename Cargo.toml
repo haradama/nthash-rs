@@ -1,7 +1,15 @@
 [package]
-name    = "nthash-rs"
-version = "0.1.0"
-edition = "2021"
+name             = "nthash-rs"
+version          = "0.1.0"
+edition          = "2021"
+description      = "Pure‑Rust port of ntHash"
+license          = "MIT"
+repository       = "https://github.com/haradama/nthash-rs"
+documentation    = "https://docs.rs/nthash-rs"
+homepage         = "https://github.com/haradama/nthash-rs"
+keywords         = ["bioinformatics", "k-mer", "dna", "hash", "rolling-hash"]
+categories       = ["science::bioinformatics::genomics", "science::bioinformatics::sequence-analysis"]
+authors          = ["haradama <harada@sfc.wide.ad.jp>"]
 
 [dependencies]
 thiserror   = "2.0.12"
