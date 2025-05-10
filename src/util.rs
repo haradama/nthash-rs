@@ -24,7 +24,7 @@ use crate::constants::{MULTISEED, MULTISHIFT};
 /// # Examples
 ///
 /// ```
-/// # use nthash::util::canonical;
+/// # use nthash_rs::util::canonical;
 /// let fwd = 0xFFFF_FFFF_FFFF_FFFF;
 /// let rev = 1;
 /// // wraps around to 0
@@ -58,7 +58,7 @@ pub const fn canonical(fwd: u64, rev: u64) -> u64 {
 /// # Examples
 ///
 /// ```
-/// # use nthash::util::extend_hashes;
+/// # use nthash_rs::util::extend_hashes;
 /// let mut out = [0u64; 4];
 /// extend_hashes(0x1234, 0x5678, 5, &mut out);
 /// assert_eq!(out[0], 0x1234u64.wrapping_add(0x5678));
