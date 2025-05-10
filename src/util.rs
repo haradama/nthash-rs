@@ -75,14 +75,13 @@ pub fn extend_hashes(fwd: u64, rev: u64, k: u32, hashes: &mut [u64]) {
     let base = canonical(fwd, rev);
     hashes[0] = base;
 
+    let seed  = (k as u64).wrapping_mul(MULTISEED);
+
     // Compute extra hashes for i = 1 .. len−1
     for (i, slot) in hashes.iter_mut().enumerate().skip(1) {
-        // identical to C++ reference: h_i = h_0 * (i ^ (k * MULTISEED))
-        let mix = (i as u64) ^ (k as u64).wrapping_mul(MULTISEED);
-        let mut t = base.wrapping_mul(mix);
-        // final avalanche shift
-        t ^= t >> MULTISHIFT;
-        *slot = t;
+        let mut h = base.wrapping_mul((i as u64) ^ seed);
+        h ^= h >> MULTISHIFT;
+        *slot = h;
     }
 }
 
