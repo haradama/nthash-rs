@@ -42,11 +42,11 @@
 // Not re‑exported directly.
 mod constants;
 mod tables;
-mod util;
 
 /// High‑level contiguous k‑mer rolling hasher.
 /// Skips over non‑ACGT bases exactly as the original reference.
 pub mod kmer;
+pub mod util;
 
 // ──────────────────────────────────────────────────────────────
 // Re‑exports: public API surface
