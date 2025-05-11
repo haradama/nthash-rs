@@ -24,7 +24,6 @@ pub type Result<T> = crate::Result<T>;
 
 /// Rolling k‑mer hasher over a contiguous DNA sequence.
 ///
-/// Mirrors the C++ `NtHash`:
 /// - Initialization is deferred until the first valid k‑mer (skips any
 ///   windows containing `N`).
 /// - `roll()` / `roll_back()` advance by one base, handling skips transparently.
@@ -229,12 +228,8 @@ impl<'a> NtHash<'a> {
     }
 }
 
-// ──────────────────────────────────────────────────────────────
-// Stateless helpers, matching the C++ reference.
-// -------------------------------------------------------------------------
-
 #[inline(always)]
-fn has_invalid_base(seq: &[u8], k: usize, pos_n: &mut usize) -> bool {
+pub fn has_invalid_base(seq: &[u8], k: usize, pos_n: &mut usize) -> bool {
     if let Some(idx) = seq[..k]
         .iter()
         .rposition(|&c| SEED_TAB[c as usize] == SEED_N)
@@ -249,34 +244,33 @@ fn has_invalid_base(seq: &[u8], k: usize, pos_n: &mut usize) -> bool {
 #[inline]
 pub fn base_forward_hash(seq: &[u8], k: u16) -> u64 {
     let k = k as usize;
-    let mut h = 0;
+    let mut h = 0_u64;
+
     for chunk in seq[..k - k % 4].chunks_exact(4) {
         h = srol_n(h, 4);
-        let idx = ((CONVERT_TAB[chunk[0] as usize] as usize) << 6)
-            | ((CONVERT_TAB[chunk[1] as usize] as usize) << 4)
-            | ((CONVERT_TAB[chunk[2] as usize] as usize) << 2)
-            | (CONVERT_TAB[chunk[3] as usize] as usize);
-        h ^= TETRAMER_TAB[idx];
+
+        // build 0‑255 index with 8‑bit wrapping
+        let idx = (CONVERT_TAB[chunk[0] as usize] as usize) * 64
+            + (CONVERT_TAB[chunk[1] as usize] as usize) * 16
+            + (CONVERT_TAB[chunk[2] as usize] as usize) * 4
+            + CONVERT_TAB[chunk[3] as usize] as usize;
+        h ^= TETRAMER_TAB[idx & 0xFF];
     }
+
+    h = srol_n(h, (k % 4) as u32);
     match k % 4 {
         3 => {
-            h = srol_n(h, 3);
-            let idx = ((CONVERT_TAB[seq[k - 3] as usize] as usize) << 4)
-                | ((CONVERT_TAB[seq[k - 2] as usize] as usize) << 2)
-                | (CONVERT_TAB[seq[k - 1] as usize] as usize);
-
-            h ^= TRIMER_TAB[idx];
+            let idx = (CONVERT_TAB[seq[k - 3] as usize] as usize) * 16
+                + (CONVERT_TAB[seq[k - 2] as usize] as usize) * 4
+                + CONVERT_TAB[seq[k - 1] as usize] as usize;
+            h ^= TRIMER_TAB[idx & 0x3F];
         }
         2 => {
-            h = srol_n(h, 2);
-            let idx = ((CONVERT_TAB[seq[k - 2] as usize] as usize) << 2)
-                | (CONVERT_TAB[seq[k - 1] as usize] as usize);
-            h ^= DIMER_TAB[idx];
+            let idx = (CONVERT_TAB[seq[k - 2] as usize] as usize) * 4
+                + CONVERT_TAB[seq[k - 1] as usize] as usize;
+            h ^= DIMER_TAB[idx & 0x0F];
         }
-        1 => {
-            h = srol_n(h, 1);
-            h ^= SEED_TAB[seq[k - 1] as usize];
-        }
+        1 => h ^= SEED_TAB[seq[k - 1] as usize],
         _ => {}
     }
     h
@@ -285,32 +279,41 @@ pub fn base_forward_hash(seq: &[u8], k: u16) -> u64 {
 #[inline]
 pub fn base_reverse_hash(seq: &[u8], k: u16) -> u64 {
     let k = k as usize;
-    let mut h = 0;
+    let mut h = 0_u64;
+
+    // Handle the ‘tail’ (k % 4 = 1,2,3)
     match k % 4 {
         3 => {
-            let idx = ((RC_CONVERT_TAB[seq[k - 1] as usize] as usize) << 4)
-                | ((RC_CONVERT_TAB[seq[k - 2] as usize] as usize) << 2)
-                | (RC_CONVERT_TAB[seq[k - 3] as usize] as usize);
-            h ^= TRIMER_TAB[idx];
+            let idx = (RC_CONVERT_TAB[seq[k - 1] as usize] as usize) * 16
+                + (RC_CONVERT_TAB[seq[k - 2] as usize] as usize) * 4
+                + RC_CONVERT_TAB[seq[k - 3] as usize] as usize;
+            h ^= TRIMER_TAB[idx & 0x3F];
         }
         2 => {
-            let idx = ((RC_CONVERT_TAB[seq[k - 1] as usize] as usize) << 2)
-                | (RC_CONVERT_TAB[seq[k - 2] as usize] as usize);
-            h ^= DIMER_TAB[idx];
+            let idx = (RC_CONVERT_TAB[seq[k - 1] as usize] as usize) * 4
+                + RC_CONVERT_TAB[seq[k - 2] as usize] as usize;
+            h ^= DIMER_TAB[idx & 0x0F];
         }
         1 => {
-            h ^= SEED_TAB[(seq[k - 1] & CP_OFF) as usize];
+            let c = seq[k - 1] & CP_OFF;
+            h ^= SEED_TAB[c as usize];
         }
         _ => {}
     }
+
+    // Process full 4‑mer chunks in reverse order
     let mut i = k - k % 4;
     while i >= 4 {
+        // split‑rotate the accumulator by 4
         h = srol_n(h, 4);
-        let idx = ((RC_CONVERT_TAB[seq[i - 1] as usize] as usize) << 6)
-            | ((RC_CONVERT_TAB[seq[i - 2] as usize] as usize) << 4)
-            | ((RC_CONVERT_TAB[seq[i - 3] as usize] as usize) << 2)
-            | (RC_CONVERT_TAB[seq[i - 4] as usize] as usize);
-        h ^= TETRAMER_TAB[idx];
+
+        // build 4‑mer index, mask to 8 bits
+        let idx = (RC_CONVERT_TAB[seq[i - 1] as usize] as usize) * 64
+            + (RC_CONVERT_TAB[seq[i - 2] as usize] as usize) * 16
+            + (RC_CONVERT_TAB[seq[i - 3] as usize] as usize) * 4
+            + RC_CONVERT_TAB[seq[i - 4] as usize] as usize;
+        h ^= TETRAMER_TAB[idx & 0xFF];
+
         i -= 4;
     }
     h
@@ -346,7 +349,7 @@ fn prev_reverse_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
     h
 }
 
-// ──────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 // Builder + Iterator facade
 // -------------------------------------------------------------------------
 
@@ -414,9 +417,8 @@ impl<'a> Iterator for NtHashIter<'a> {
             self.done = true;
             return None;
         }
-        let pos = self.hasher.pos();
-        let hashes = self.hasher.hashes().to_vec();
-        Some((pos, hashes))
+        let out = (self.hasher.pos(), self.hasher.hashes().to_owned());
+        Some(out)
     }
 }
 

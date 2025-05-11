@@ -1,7 +1,5 @@
-// benches/benchmark.rs
-
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use nthash_rs::kmer::NtHashBuilder;
+use nthash_rs::{kmer::NtHashBuilder, BlindNtHashBuilder};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Generate a pseudo‐random DNA sequence of length `len` by
@@ -27,12 +25,42 @@ fn bench_nthash(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(seq.len() as u64));
 
     group.bench_with_input(
-        BenchmarkId::new("ntHash", seq.len()),
+        BenchmarkId::new("NtHash", seq.len()),
         &seq,
         |b, seq| {
             b.iter(|| {
                 // build a new rolling iterator each iteration
                 let mut iter = NtHashBuilder::new(seq)
+                    .k(k)
+                    .num_hashes(m)
+                    .pos(0)
+                    .finish()
+                    .unwrap();
+                // consume it
+                while let Some((_pos, _hashes)) = iter.next() {
+                    // no-op
+                }
+            })
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_blindnthash(c: &mut Criterion) {
+    let seq = generate_dna(1_000_000);
+    let k: u16 = 31;
+    let m: u8 = 1;
+
+    let mut group = c.benchmark_group("nthash_vs_xxhash");
+    group.throughput(Throughput::Bytes(seq.len() as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("BlindNtHash", seq.len()),
+        &seq,
+        |b, seq| {
+            b.iter(|| {
+                let mut iter = BlindNtHashBuilder::new(seq)
                     .k(k)
                     .num_hashes(m)
                     .pos(0)
@@ -73,5 +101,5 @@ fn bench_xxh3(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_nthash, bench_xxh3);
+criterion_group!(benches, bench_nthash, bench_blindnthash, bench_xxh3);
 criterion_main!(benches);

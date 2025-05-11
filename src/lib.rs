@@ -43,10 +43,11 @@
 mod constants;
 mod tables;
 
+pub mod util;
 /// High‑level contiguous k‑mer rolling hasher.
 /// Skips over non‑ACGT bases exactly as the original reference.
 pub mod kmer;
-pub mod util;
+pub mod blind;
 
 // ──────────────────────────────────────────────────────────────
 // Re‑exports: public API surface
@@ -68,8 +69,10 @@ pub use util::extend_hashes;
 ///
 /// See [`kmer::NtHash`] for full documentation.
 pub use kmer::NtHash;
-
 pub use kmer::NtHashBuilder;
+
+pub use blind::BlindNtHash;
+pub use blind::BlindNtHashBuilder;
 
 // ──────────────────────────────────────────────────────────────
 // Crate‑wide result and error types

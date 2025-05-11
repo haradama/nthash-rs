@@ -7,16 +7,13 @@
 
 Pure‑Rust port of [ntHash](https://github.com/bcgsc/ntHash) rolling‑hash suite, focused on contiguous k‑mer hashing for DNA sequences.
 
-> **Note**: At the moment **only the canonical contiguous k‑mer hasher** (`kmer::NtHash`) is implemented.  
-> Blind‐mode (`BlindNtHash`) and spaced‑seed variants (`SeedNtHash`, `BlindSeedNtHash`) are planned but not yet available.
+> **Note**: At the moment `NtHash` and `BlindNtHash` are implemented.  
+> Spaced‑seed variants (`SeedNtHash`, `BlindSeedNtHash`) is planned but not yet available.
 
 ## Installation
 
-Add to your `Cargo.toml`:
-
 ```toml
-[dependencies]
-nthash-rs = "0.1"
+cargo add nthash-rs
 ```
 
 ## Quick Start
