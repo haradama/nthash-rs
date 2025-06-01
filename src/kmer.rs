@@ -52,7 +52,7 @@ impl<'a> NtHash<'a> {
     /// # Errors
     ///
     /// Returns if `k == 0`, `seq.len() < k`, or `pos` too large.
-    pub fn new(seq: &'a str, k: u16, num_hashes: u8, pos: usize) -> Result<Self> {
+    pub fn new(seq: &'a [u8], k: u16, num_hashes: u8, pos: usize) -> Result<Self> {
         if k == 0 {
             return Err(NtHashError::InvalidK);
         }
@@ -65,7 +65,7 @@ impl<'a> NtHash<'a> {
             return Err(NtHashError::PositionOutOfRange { pos, seq_len: len });
         }
         Ok(Self {
-            seq: seq.as_bytes(),
+            seq: seq,
             k,
             pos,
             initialized: false,
@@ -355,7 +355,7 @@ fn prev_reverse_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
 
 /// Configure and consume a rolling‐hash computation as an iterator.
 pub struct NtHashBuilder<'a> {
-    seq: &'a str,
+    seq: &'a [u8],
     k: u16,
     num_hashes: u8,
     pos: usize,
@@ -363,7 +363,7 @@ pub struct NtHashBuilder<'a> {
 
 impl<'a> NtHashBuilder<'a> {
     /// Begin building over `seq`.
-    pub fn new(seq: &'a str) -> Self {
+    pub fn new(seq: &'a [u8]) -> Self {
         NtHashBuilder {
             seq,
             k: 0,

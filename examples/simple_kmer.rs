@@ -10,7 +10,7 @@ fn main() -> Result<(), NtHashError> {
         let num_hashes: u8 = 3;
 
         println!("## NtHash Low-Level API");
-        let mut h = NtHash::new(seq, kmer_size, num_hashes, 0)?;
+        let mut h = NtHash::new(seq.as_bytes(), kmer_size, num_hashes, 0)?;
         while h.roll() {
             let pos   = h.pos() as usize;
             let end = pos + kmer_size as usize;
@@ -20,7 +20,7 @@ fn main() -> Result<(), NtHashError> {
         }
 
         println!("## NtHashBuilder");
-        let iter = NtHashBuilder::new(seq)
+        let iter = NtHashBuilder::new(seq.as_bytes())
             .k(kmer_size)
             .num_hashes(num_hashes)
             .pos(0)

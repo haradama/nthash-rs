@@ -1,7 +1,7 @@
 //! **Streaming (“blind”) ntHash** for *contiguous* k‑mers.
 //!
 //! Unlike [`kmer::NtHash`](crate::kmer), which owns an entire DNA string and
-//! skips windows containing ‘N’, **`BlindNtHash` works on a pre‑cleaned input
+//! skips windows containing  'N', **`BlindNtHash` works on a pre‑cleaned input
 //! where every window of length *k* is known to be valid**.  
 //!
 //! The hasher maintains an *exact* k‑base sliding window in a small ring

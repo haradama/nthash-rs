@@ -1,3 +1,7 @@
+use std::hash::BuildHasher;
+use std::hash::Hasher;
+
+use ahash::RandomState;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use nthash_rs::{kmer::NtHashBuilder, BlindNtHashBuilder};
 use xxhash_rust::xxh3::xxh3_64;
@@ -21,7 +25,7 @@ fn bench_nthash(c: &mut Criterion) {
     let k: u16 = 31;
     let m: u8 = 1;
 
-    let mut group = c.benchmark_group("nthash_vs_xxhash");
+    let mut group = c.benchmark_group("nthash_vs_others");
     group.throughput(Throughput::Bytes(seq.len() as u64));
 
     group.bench_with_input(
@@ -30,7 +34,7 @@ fn bench_nthash(c: &mut Criterion) {
         |b, seq| {
             b.iter(|| {
                 // build a new rolling iterator each iteration
-                let mut iter = NtHashBuilder::new(seq)
+                let mut iter = NtHashBuilder::new(seq.as_bytes())
                     .k(k)
                     .num_hashes(m)
                     .pos(0)
@@ -52,7 +56,7 @@ fn bench_blindnthash(c: &mut Criterion) {
     let k: u16 = 31;
     let m: u8 = 1;
 
-    let mut group = c.benchmark_group("nthash_vs_xxhash");
+    let mut group = c.benchmark_group("nthash_vs_others");
     group.throughput(Throughput::Bytes(seq.len() as u64));
 
     group.bench_with_input(
@@ -81,7 +85,7 @@ fn bench_xxh3(c: &mut Criterion) {
     let seq = generate_dna(1_000_000);
     let k: usize = 31;
 
-    let mut group = c.benchmark_group("kmer_vs_xxhash");
+    let mut group = c.benchmark_group("nthash_vs_others");
     group.throughput(Throughput::Bytes(seq.len() as u64));
 
     group.bench_with_input(
@@ -101,5 +105,31 @@ fn bench_xxh3(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_nthash, bench_blindnthash, bench_xxh3);
+fn bench_ahash(c: &mut Criterion) {
+    let seq = generate_dna(1_000_000);
+    let k: usize = 31;
+
+    let mut group = c.benchmark_group("nthash_vs_others");
+    group.throughput(Throughput::Bytes(seq.len() as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("ahash", seq.len()),
+        &seq,
+        |b, seq| {
+            let state = RandomState::new();
+            b.iter(|| {
+                let bytes = seq.as_bytes();
+                for i in 0..=bytes.len().saturating_sub(k) {
+                    let mut hasher = state.build_hasher();
+                    hasher.write(&bytes[i..i + k]);
+                    let _h = hasher.finish();
+                }
+            })
+        },
+    );
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_nthash, bench_blindnthash, bench_xxh3, bench_ahash);
 criterion_main!(benches);

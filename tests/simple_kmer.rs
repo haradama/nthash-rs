@@ -7,7 +7,7 @@ const M: u8 = 3;
 #[test]
 fn regression_simple_kmer() {
     // build our iterator
-    let iter = NtHashBuilder::new(SEQ)
+    let iter = NtHashBuilder::new(SEQ.as_bytes())
         .k(K)
         .num_hashes(M)
         .pos(0)

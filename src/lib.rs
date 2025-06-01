@@ -18,7 +18,7 @@
 //!
 //! fn main() -> Result<()> {
 //!     // Create a new NtHash over "ACGTNACGT", k=4, emit 2 hashes per k‑mer, start at pos=0
-//!     let mut hasher = NtHash::new("ACGTNACGT", 4, 2, 0)?;
+//!     let mut hasher = NtHash::new(b"ACGTNACGT", 4, 2, 0)?;
 //!
 //!     // First call to roll() initializes and returns true if a valid k‑mer was found
 //!     assert!(hasher.roll());
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn sanity_kmer() {
         // Create hasher over "ACGTACGT", k=4, 1 hash per k‑mer, start at 0
-        let mut h = NtHash::new("ACGTACGT", 4, 1, 0).unwrap();
+        let mut h = NtHash::new("ACGTACGT".as_bytes(), 4, 1, 0).unwrap();
         // First valid k‑mer should be produced
         assert!(h.roll());
         assert_eq!(h.hashes().len(), 1);

@@ -15,6 +15,7 @@ authors          = ["haradama <harada@sfc.wide.ad.jp>"]
 thiserror   = "2.0.12"
 
 [dev-dependencies]
+ahash = "0.8.12"
 criterion = "0.5.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
