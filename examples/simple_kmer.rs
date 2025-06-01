@@ -40,7 +40,7 @@ fn main() -> Result<(), NtHashError> {
         let num_hashes: u8 = 3;
 
         println!("## BlindNtHash Low-Level API");
-        let mut h = BlindNtHash::new(seq, kmer_size, num_hashes, 0)?;
+        let mut h = BlindNtHash::new(seq.as_bytes(), kmer_size, num_hashes, 0)?;
         for incoming in seq.as_bytes()[kmer_size as usize..].iter().copied() {
             h.roll(incoming);
     
@@ -52,7 +52,7 @@ fn main() -> Result<(), NtHashError> {
         }
 
         println!("## BlindNtHashBuilder");
-        let iter = BlindNtHashBuilder::new(seq)
+        let iter = BlindNtHashBuilder::new(seq.as_bytes())
             .k(kmer_size)
             .num_hashes(num_hashes)
             .pos(0)

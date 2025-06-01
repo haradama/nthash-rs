@@ -64,7 +64,7 @@ fn bench_blindnthash(c: &mut Criterion) {
         &seq,
         |b, seq| {
             b.iter(|| {
-                let mut iter = BlindNtHashBuilder::new(seq)
+                let mut iter = BlindNtHashBuilder::new(seq.as_bytes())
                     .k(k)
                     .num_hashes(m)
                     .pos(0)

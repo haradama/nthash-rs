@@ -51,7 +51,7 @@ impl BlindNtHash {
     /// # Errors
     ///
     /// Returns if `k == 0`, `seq.len() < k`, or `pos` too large.
-    pub fn new(seq: &str, k: u16, num_hashes: u8, pos: isize) -> Result<Self> {
+    pub fn new(seq: &[u8], k: u16, num_hashes: u8, pos: isize) -> Result<Self> {
         if k == 0 {
             return Err(NtHashError::InvalidK);
         }
@@ -65,7 +65,7 @@ impl BlindNtHash {
             });
         }
 
-        let slice = &seq.as_bytes()[(pos as usize)..(pos as usize + k_usz)];
+        let slice = &seq[(pos as usize)..(pos as usize + k_usz)];
         let mut window = VecDeque::with_capacity(k_usz);
         window.extend(slice.iter().copied());
 
@@ -182,14 +182,14 @@ fn prev_reverse_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
 }
 
 pub struct BlindNtHashBuilder<'a> {
-    seq: &'a str,
+    seq: &'a [u8],
     k: u16,
     num_hashes: u8,
     start_pos: usize,
 }
 
 impl<'a> BlindNtHashBuilder<'a> {
-    pub fn new(seq: &'a str) -> Self {
+    pub fn new(seq: &'a [u8]) -> Self {
         Self {
             seq,
             k: 0,
@@ -217,7 +217,7 @@ impl<'a> BlindNtHashBuilder<'a> {
         let hasher = BlindNtHash::new(self.seq, self.k, self.num_hashes, self.start_pos as isize)?;
         let end = self.seq.len() - self.k as usize;
         Ok(BlindNtHashIter {
-            seq: self.seq.as_bytes(),
+            seq: self.seq,
             end,
             hasher,
             first: true,
