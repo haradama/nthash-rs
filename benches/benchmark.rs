@@ -3,6 +3,7 @@ use std::hash::Hasher;
 
 use ahash::RandomState;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use nthash_rs::SeedNtHashBuilder;
 use nthash_rs::{kmer::NtHashBuilder, BlindNtHashBuilder};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -81,6 +82,37 @@ fn bench_blindnthash(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_seednthash(c: &mut Criterion) {
+    let seq = generate_dna(1_000_000);
+    let k: u16 = 31;
+    let m: usize = 1;
+
+    let mut group = c.benchmark_group("nthash_vs_others");
+    group.throughput(Throughput::Bytes(seq.len() as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("SeedNtHash", seq.len()),
+        &seq,
+        |b, seq| {
+            b.iter(|| {
+                let mut iter = SeedNtHashBuilder::new(seq.as_bytes())
+                    .k(k)
+                    .masks(vec!["0000000000000000000000000000000".to_string()])
+                    .num_hashes(m)
+                    .pos(0)
+                    .finish()
+                    .unwrap();
+                // consume it
+                while let Some((_pos, _hashes)) = iter.next() {
+                    // no-op
+                }
+            })
+        },
+    );
+
+    group.finish();
+}
+
 fn bench_xxh3(c: &mut Criterion) {
     let seq = generate_dna(1_000_000);
     let k: usize = 31;
@@ -131,5 +163,5 @@ fn bench_ahash(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_nthash, bench_blindnthash, bench_xxh3, bench_ahash);
+criterion_group!(benches, bench_nthash, bench_blindnthash, bench_seednthash, bench_xxh3, bench_ahash);
 criterion_main!(benches);

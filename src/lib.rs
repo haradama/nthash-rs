@@ -71,7 +71,6 @@ pub use util::extend_hashes;
 /// See [`kmer::NtHash`] for full documentation.
 pub use kmer::NtHash;
 pub use kmer::NtHashBuilder;
-pub use kmer::NtHashIter;
 
 pub use blind::BlindNtHash;
 pub use blind::BlindNtHashBuilder;
