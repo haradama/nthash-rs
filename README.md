@@ -45,9 +45,13 @@ fn main() -> Result<(), NtHashError> {
 If you prefer to manage the rolling yourself:
 
 ```rust
-use nthash_rs::kmer::NtHash;
+use nthash_rs::NtHash;
 
-let mut h = NtHash::new(b"ACGTCAGTACGT", 5, 1, 0)?;
+let seq = b"ACGTCAGTNNNNACGTACGT";
+let k = 4u16;
+let m = 2u8;
+
+let mut h = NtHash::new(seq, k, m, 0)?;
 if h.roll() {
     println!("first hash: {:#x}", h.hashes()[0]);
 }
