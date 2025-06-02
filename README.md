@@ -7,12 +7,9 @@
 
 Pure‑Rust port of [ntHash](https://github.com/bcgsc/ntHash) rolling‑hash suite, focused on contiguous k‑mer hashing for DNA sequences.
 
-> **Note**: At the moment `NtHash` and `BlindNtHash` are implemented.  
-> Spaced‑seed variants (`SeedNtHash`, `BlindSeedNtHash`) is planned but not yet available.
-
 ## Installation
 
-```toml
+```shell
 cargo add nthash-rs
 ```
 
@@ -22,7 +19,7 @@ cargo add nthash-rs
 use nthash_rs::{NtHashBuilder, NtHashError};
 
 fn main() -> Result<(), NtHashError> {
-    let seq = "ACGTCAGTNNNNACGTACGT";
+    let seq = b"ACGTCAGTNNNNACGTACGT";
     let k = 4u16;
     let m = 2u8; // number of hashes per k-mer
 
@@ -50,7 +47,7 @@ If you prefer to manage the rolling yourself:
 ```rust
 use nthash_rs::kmer::NtHash;
 
-let mut h = NtHash::new("ACGTCAGTACGT", 5, 1, 0)?;
+let mut h = NtHash::new(b"ACGTCAGTACGT", 5, 1, 0)?;
 if h.roll() {
     println!("first hash: {:#x}", h.hashes()[0]);
 }

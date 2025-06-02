@@ -48,6 +48,7 @@ pub mod util;
 /// Skips over non‑ACGT bases exactly as the original reference.
 pub mod kmer;
 pub mod blind;
+pub mod seed;
 
 // ──────────────────────────────────────────────────────────────
 // Re‑exports: public API surface
@@ -70,9 +71,13 @@ pub use util::extend_hashes;
 /// See [`kmer::NtHash`] for full documentation.
 pub use kmer::NtHash;
 pub use kmer::NtHashBuilder;
+pub use kmer::NtHashIter;
 
 pub use blind::BlindNtHash;
 pub use blind::BlindNtHashBuilder;
+
+pub use seed::SeedNtHash;
+pub use seed::SeedNtHashBuilder;
 
 // ──────────────────────────────────────────────────────────────
 // Crate‑wide result and error types
@@ -95,6 +100,12 @@ pub enum NtHashError {
     /// Starting `pos` is beyond the last valid window (`seq.len() - k`).
     #[error("position ({pos}) exceeds sequence length ({seq_len})")]
     PositionOutOfRange { pos: usize, seq_len: usize },
+
+    #[error("invalid sequence")]
+    InvalidSequence,
+
+    #[error("invalid window offsets")]
+    InvalidWindowOffsets,
 }
 
 // ──────────────────────────────────────────────────────────────
