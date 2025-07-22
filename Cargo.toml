@@ -12,6 +12,7 @@ categories       = ["science::bioinformatics::genomics", "science::bioinformatic
 authors          = ["haradama <harada@sfc.wide.ad.jp>"]
 
 [dependencies]
+pulp = "0.21.5"
 thiserror   = "2.0.12"
 
 [dev-dependencies]

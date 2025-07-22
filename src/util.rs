@@ -15,6 +15,8 @@
 
 use crate::constants::{MULTISEED, MULTISHIFT};
 
+use pulp::{Arch, Simd, WithSimd};
+
 /// Combine forward and reverse‐complement strand hashes into a single
 /// *canonical* k‑mer hash (strand‐independent).
 ///
@@ -70,7 +72,32 @@ pub fn extend_hashes(fwd: u64, rev: u64, k: u32, hashes: &mut [u64]) {
     if hashes.is_empty() {
         return;
     }
+    Arch::new().dispatch(Ext {
+        fwd,
+        rev,
+        k,
+        out: hashes,
+    });
+}
 
+struct Ext<'a> {
+    fwd: u64,
+    rev: u64,
+    k:   u32,
+    out: &'a mut [u64],
+}
+
+impl<'a> WithSimd for Ext<'a> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, _simd: S) -> Self::Output {
+        scalar_extend(self.fwd, self.rev, self.k, self.out);
+    }
+}
+
+#[inline(always)]
+fn scalar_extend(fwd: u64, rev: u64, k: u32, hashes: &mut [u64]) {
     // Base (canonical) hash at index 0
     let base = canonical(fwd, rev);
     hashes[0] = base;
