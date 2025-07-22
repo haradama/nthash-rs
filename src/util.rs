@@ -67,15 +67,20 @@ pub const fn canonical(fwd: u64, rev: u64) -> u64 {
 /// ```
 #[inline]
 pub fn extend_hashes(fwd: u64, rev: u64, k: u32, hashes: &mut [u64]) {
-    if hashes.is_empty() {
-        return;
+    match hashes.len() {
+        0 => return,
+        1 => {
+            hashes[0] = canonical(fwd, rev);
+            return;
+        }
+        _ => {}
     }
 
     // Base (canonical) hash at index 0
     let base = canonical(fwd, rev);
     hashes[0] = base;
 
-    let seed  = (k as u64).wrapping_mul(MULTISEED);
+    let seed = (k as u64).wrapping_mul(MULTISEED);
 
     // Compute extra hashes for i = 1 .. len−1
     for (i, slot) in hashes.iter_mut().enumerate().skip(1) {
