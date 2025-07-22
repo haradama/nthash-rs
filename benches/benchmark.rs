@@ -3,9 +3,11 @@ use std::hash::Hasher;
 
 use ahash::RandomState;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use fxhash::FxHasher64;
+use xxhash_rust::xxh3::xxh3_64;
+
 use nthash_rs::SeedNtHashBuilder;
 use nthash_rs::{kmer::NtHashBuilder, BlindNtHashBuilder};
-use xxhash_rust::xxh3::xxh3_64;
 
 /// Generate a pseudo‐random DNA sequence of length `len` by
 /// repeating "ACGT" and inserting occasional "N"s.
@@ -163,5 +165,30 @@ fn bench_ahash(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_nthash, bench_blindnthash, bench_seednthash, bench_xxh3, bench_ahash);
+fn bench_fxhash(c: &mut Criterion) {
+    let seq = generate_dna(1_000_000);
+    let k: usize = 31;
+
+    let mut group = c.benchmark_group("nthash_vs_others");
+    group.throughput(Throughput::Bytes(seq.len() as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("fxhash64", seq.len()),
+        &seq,
+        |b, seq| {
+            b.iter(|| {
+                let bytes = seq.as_bytes();
+                for i in 0..=bytes.len().saturating_sub(k) {
+                    let mut hasher = FxHasher64::default();
+                    hasher.write(&bytes[i..i + k]);
+                    let _h = hasher.finish();
+                }
+            })
+        },
+    );
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_nthash, bench_blindnthash, bench_seednthash, bench_xxh3, bench_fxhash, bench_ahash);
 criterion_main!(benches);
