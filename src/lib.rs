@@ -43,14 +43,14 @@
 mod constants;
 mod tables;
 
-pub mod util;
+pub mod blind;
 /// High‑level contiguous k‑mer rolling hasher.
 /// Skips over non‑ACGT bases exactly as the original reference.
 pub mod kmer;
-pub mod blind;
 pub mod seed;
+pub mod util;
 
-// ──────────────────────────────────────────────────────────────
+// --------------------------------------------------------------------------
 // Re‑exports: public API surface
 // --------------------------------------------------------------------------
 
@@ -78,11 +78,11 @@ pub use blind::BlindNtHashBuilder;
 pub use seed::SeedNtHash;
 pub use seed::SeedNtHashBuilder;
 
-// ──────────────────────────────────────────────────────────────
+// --------------------------------------------------------------------------
 // Crate‑wide result and error types
 // --------------------------------------------------------------------------
 
-/// Shorthand `Result` alias for this crate’s operations.
+/// Shorthand `Result` alias for this crate's operations.
 pub type Result<T, E = NtHashError> = std::result::Result<T, E>;
 
 /// Errors common to all ntHash k‑mer hashers.
@@ -107,7 +107,7 @@ pub enum NtHashError {
     InvalidWindowOffsets,
 }
 
-// ──────────────────────────────────────────────────────────────
+// --------------------------------------------------------------------------
 // Basic smoke tests
 // --------------------------------------------------------------------------
 #[cfg(test)]

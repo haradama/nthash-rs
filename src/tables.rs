@@ -202,11 +202,11 @@ mod tests {
     fn srol_table_boundaries() {
         // Representative parameters for srol_table boundary testing:
         // Parameter c (table index):
-        //   0  (N default)  – seed table for ambiguous base ‘N’
-        //   1  (T)          – seed table for base ‘T’
-        //   3  (G)          – seed table for base ‘G’
-        //   4  (A)          – seed table for base ‘A’ (4th entry in ASCII mapping)
-        //   7  (C)          – seed table for base ‘C’
+        //   0  (N default)  – seed table for ambiguous base 'N'
+        //   1  (T)          – seed table for base 'T'
+        //   3  (G)          – seed table for base 'G'
+        //   4  (A)          – seed table for base 'A' (4th entry in ASCII mapping)
+        //   7  (C)          – seed table for base 'C'
         //
         // Parameter d (rotation count):
         //   0   (no‑op)     – no rotation, direct table lookup

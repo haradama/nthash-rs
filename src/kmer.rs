@@ -3,7 +3,7 @@
 //! This module provides a panic‑free, idiomatic Rust port of the C++ `NtHash`
 //! class.  It computes rolling hashes over DNA k‑mers (A/C/G/T/N) in **O(1)**
 //! time per base (after an initial **O(k)** seed computation), skipping over
-//! any windows that contain ‘N’ exactly as the reference does.
+//! any windows that contain 'N' exactly as the reference does.
 //!
 //! All heavy bit‑twiddling is delegated to the `tables` (split‑rotate) and
 //! `constants` (lookup tables) modules, plus `util::extend_hashes` for
@@ -281,7 +281,7 @@ pub fn base_reverse_hash(seq: &[u8], k: u16) -> u64 {
     let k = k as usize;
     let mut h = 0_u64;
 
-    // Handle the ‘tail’ (k % 4 = 1,2,3)
+    // Handle the 'tail' (k % 4 = 1,2,3)
     match k % 4 {
         3 => {
             let idx = (RC_CONVERT_TAB[seq[k - 1] as usize] as usize) * 16

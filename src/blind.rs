@@ -46,7 +46,7 @@ impl BlindNtHash {
     /// Create a new `BlindNtHash` whose initial window is `seq[pos..pos+k]`.
     ///
     /// * The caller must guarantee* that the slice contains **no ambiguous
-    /// bases (‘N’)** – the blind variant will not skip over invalid windows.
+    /// bases ('N')** – the blind variant will not skip over invalid windows.
     ///
     /// # Errors
     ///

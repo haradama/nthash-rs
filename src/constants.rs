@@ -13,7 +13,7 @@
 //! - Pre‑hashed dimer/trimer/tetramer tables.  
 //! - ASCII → nucleotide index and reverse‑complement index tables.  
 //!
-//! These tables drive all of ntHash’s core operations without runtime
+//! These tables drive all of ntHash's core operations without runtime
 //! branching.
 
 /// Number of ASCII codes.
