@@ -7,7 +7,7 @@
 //! (`srol_table`) that applies a split‑rotate to a pre‑seeded constant
 //! (A/C/G/T/N) and supports arbitrary rotation distances without branches.
 //!
-//! All functions are marked `#[inline(always)]` for maximum performance — each
+//! All functions are marked `#[inline(always)]` for maximum performance - each
 //! compiles down to a handful of shifts, masks, and table lookups.
 
 use crate::constants::{MS_TAB_31L, MS_TAB_33R};

@@ -3,9 +3,9 @@
 //! This module provides two small yet critical building blocks used by
 //! every ntHash implementation (`NtHash`, `SeedNtHash`, `BlindNtHash`, etc.):
 //!
-//! - **`canonical`** — combine forward and reverse‐complement hashes into a
+//! - **`canonical`** - combine forward and reverse‐complement hashes into a
 //!   strand‐independent value by wrapping addition.
-//! - **`extend_hashes`** — generate a sequence of "extra" hash values from
+//! - **`extend_hashes`** - generate a sequence of "extra" hash values from
 //!   one canonical base hash, matching the C++ reference's multiplicative
 //!   mixing and shift scheme.
 //!
@@ -47,9 +47,9 @@ pub const fn canonical(fwd: u64, rev: u64) -> u64 {
 ///   h_i  ^= h_i >> MULTISHIFT
 /// ```
 ///
-/// - `fwd`, `rev`  — forward and reverse‐complement strand hashes.
-/// - `k`           — k‑mer span or seed weight, used in the mixing step.
-/// - `hashes`      — output slice; the length determines how many values
+/// - `fwd`, `rev`  - forward and reverse‐complement strand hashes.
+/// - `k`           - k‑mer span or seed weight, used in the mixing step.
+/// - `hashes`      - output slice; the length determines how many values
 ///                   (including the canonical hash at index 0) are generated.
 ///
 /// If `hashes` is empty, this function returns immediately, avoiding any
