@@ -14,7 +14,7 @@
 
 use crate::{
     constants::*,
-    tables::{srol, srol_n, srol_table, sror},
+    tables::{base_code, srol, srol_n, sror, RollConsts},
     util::extend_hashes,
     NtHashError, // unified crate-level error
 };
@@ -37,25 +37,8 @@ pub struct NtHash<'a> {
     fwd_hash: u64,
     rev_hash: u64,
     hashes: Vec<u64>,
-    /// Precomputed `srol_table(c, k)` for every byte value `c`.
-    ///
-    /// `k` is fixed for the lifetime of the hasher, so the split‑rotate of each
-    /// base's seed by `k` is constant. Caching it here turns the two
-    /// `srol_table` calls in the roll hot‑path (each a pair of `% 31` / `% 33`
-    /// reductions plus a pointer‑chase through `MS_TAB_*`) into a single direct
-    /// array load.
-    srol_k: Box<[u64; 256]>,
-}
-
-/// Build the `srol_table(c, k)` lookup for every byte value `c`.
-#[inline]
-fn build_srol_k(k: u16) -> Box<[u64; 256]> {
-    let mut t = Box::new([0u64; 256]);
-    let d = k as u32;
-    for (c, slot) in t.iter_mut().enumerate() {
-        *slot = srol_table(c as u8, d);
-    }
-    t
+    /// Per-base rolling constants for this `k` (see [`RollConsts`]).
+    consts: RollConsts,
 }
 
 impl<'a> NtHash<'a> {
@@ -91,7 +74,7 @@ impl<'a> NtHash<'a> {
             fwd_hash: 0,
             rev_hash: 0,
             hashes: vec![0; num_hashes as usize],
-            srol_k: build_srol_k(k),
+            consts: RollConsts::new(k),
         })
     }
 
@@ -111,8 +94,8 @@ impl<'a> NtHash<'a> {
             return self.init();
         }
         let outgoing = self.seq[self.pos];
-        self.fwd_hash = next_forward_hash(&self.srol_k, self.fwd_hash, outgoing, incoming);
-        self.rev_hash = next_reverse_hash(&self.srol_k, self.rev_hash, outgoing, incoming);
+        self.fwd_hash = next_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
+        self.rev_hash = next_reverse_hash(&self.consts, self.rev_hash, outgoing, incoming);
         self.update_hashes();
         self.pos += 1;
         true
@@ -135,8 +118,8 @@ impl<'a> NtHash<'a> {
             return self.init();
         }
         let outgoing = self.seq[self.pos + self.k as usize - 1];
-        self.fwd_hash = prev_forward_hash(&self.srol_k, self.fwd_hash, outgoing, incoming);
-        self.rev_hash = prev_reverse_hash(&self.srol_k, self.rev_hash, outgoing, incoming);
+        self.fwd_hash = prev_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
+        self.rev_hash = prev_reverse_hash(&self.consts, self.rev_hash, outgoing, incoming);
         self.update_hashes();
         self.pos -= 1;
         true
@@ -160,8 +143,8 @@ impl<'a> NtHash<'a> {
             return false;
         }
         let outgoing = self.seq[self.pos];
-        let fwd = next_forward_hash(&self.srol_k, self.fwd_hash, outgoing, incoming);
-        let rev = next_reverse_hash(&self.srol_k, self.rev_hash, outgoing, incoming);
+        let fwd = next_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
+        let rev = next_reverse_hash(&self.consts, self.rev_hash, outgoing, incoming);
         self.fill_hash_buffer(fwd, rev);
         true
     }
@@ -184,8 +167,8 @@ impl<'a> NtHash<'a> {
             return false;
         }
         let outgoing = self.seq[self.pos + self.k as usize - 1];
-        let fwd = prev_forward_hash(&self.srol_k, self.fwd_hash, outgoing, incoming);
-        let rev = prev_reverse_hash(&self.srol_k, self.rev_hash, outgoing, incoming);
+        let fwd = prev_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
+        let rev = prev_reverse_hash(&self.consts, self.rev_hash, outgoing, incoming);
         self.fill_hash_buffer(fwd, rev);
         true
     }
@@ -340,32 +323,32 @@ pub fn base_reverse_hash(seq: &[u8], k: u16) -> u64 {
 }
 
 #[inline(always)]
-fn next_forward_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+fn next_forward_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
     let mut h = srol(prev);
-    h ^= SEED_TAB[char_in as usize];
-    h ^= srol_k[char_out as usize];
+    h ^= c.seed[base_code(char_in)];
+    h ^= c.srolk[base_code(char_out)];
     h
 }
 
 #[inline(always)]
-fn prev_forward_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
-    let mut h = prev ^ srol_k[char_in as usize];
-    h ^= SEED_TAB[char_out as usize];
+fn prev_forward_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
+    let mut h = prev ^ c.srolk[base_code(char_in)];
+    h ^= c.seed[base_code(char_out)];
     sror(h)
 }
 
 #[inline(always)]
-fn next_reverse_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
-    let mut h = prev ^ srol_k[(char_in & CP_OFF) as usize];
-    h ^= SEED_TAB[(char_out & CP_OFF) as usize];
+fn next_reverse_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
+    let mut h = prev ^ c.srolk_rc[base_code(char_in)];
+    h ^= c.seed_rc[base_code(char_out)];
     sror(h)
 }
 
 #[inline(always)]
-fn prev_reverse_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+fn prev_reverse_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
     let mut h = srol(prev);
-    h ^= SEED_TAB[(char_in & CP_OFF) as usize];
-    h ^= srol_k[(char_out & CP_OFF) as usize];
+    h ^= c.seed_rc[base_code(char_in)];
+    h ^= c.srolk_rc[base_code(char_out)];
     h
 }
 

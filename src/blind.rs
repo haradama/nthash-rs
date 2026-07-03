@@ -19,9 +19,9 @@
 use std::collections::VecDeque;
 
 use crate::{
-    constants::*,
+    constants::{CP_OFF, SEED_TAB},
     kmer::{base_forward_hash, base_reverse_hash},
-    tables::{srol, srol_table, sror},
+    tables::{build_srol_k, srol, sror},
     util::extend_hashes,
     NtHashError, Result,
 };
@@ -40,22 +40,11 @@ pub struct BlindNtHash {
     fwd_hash: u64,
     rev_hash: u64,
     hashes: Vec<u64>,
-    /// Precomputed `srol_table(c, k)` for every byte value `c`; see
-    /// [`crate::kmer`] for the rationale. `k` is fixed for the hasher's
-    /// lifetime, so this collapses the two `srol_table` calls per roll (each a
-    /// `% 31` / `% 33` reduction plus a `MS_TAB_*` pointer‑chase) into one load.
+    /// Precomputed `srol_table(c, k)` for every byte value `c`. Unlike
+    /// [`NtHash`](crate::kmer), the blind variant does not gate out `N`, so it
+    /// needs the full byte-indexed table (where `N` maps to `0`) rather than the
+    /// 4-constant `RollConsts` (which would fold `N` onto `G`).
     srol_k: Box<[u64; 256]>,
-}
-
-/// Build the `srol_table(c, k)` lookup for every byte value `c`.
-#[inline]
-fn build_srol_k(k: u16) -> Box<[u64; 256]> {
-    let mut t = Box::new([0u64; 256]);
-    let d = k as u32;
-    for (c, slot) in t.iter_mut().enumerate() {
-        *slot = srol_table(c as u8, d);
-    }
-    t
 }
 
 impl BlindNtHash {

@@ -10,7 +10,7 @@
 //! All functions are marked `#[inline(always)]` for maximum performance - each
 //! compiles down to a handful of shifts, masks, and table lookups.
 
-use crate::constants::{MS_TAB_31L, MS_TAB_33R};
+use crate::constants::{CP_OFF, MS_TAB_31L, MS_TAB_33R, SEED_TAB};
 
 /// One‑bit split‑rotate left (33 + 31 bit halves).
 ///
@@ -77,6 +77,89 @@ pub fn srol_table(c: u8, d: u32) -> u64 {
     let idx31 = (d % 31) as usize;
     let idx33 = (d % 33) as usize;
     MS_TAB_31L[c as usize][idx31] | MS_TAB_33R[c as usize][idx33]
+}
+
+/// The only byte values whose split-rotate tables are non-zero: A/C/G/T (upper
+/// and lower case), RNA `U`, and the low indices produced by `byte & CP_OFF`.
+/// Every other byte selects the all-zero `N` tables, so `srol_table(c, k) == 0`.
+const SROL_NONZERO_BYTES: [u8; 15] = [
+    b'A', b'a', b'C', b'c', b'G', b'g', b'T', b't', b'U', b'u', 1, 3, 4, 5, 7,
+];
+
+/// Precompute `srol_table(c, k)` for every byte `c` into a 256-entry table.
+///
+/// Used by [`BlindNtHash`](crate::blind), which — unlike [`NtHash`](crate::kmer)
+/// — does not skip ambiguous bases: it hashes whatever it is fed, and the
+/// reference defines an `N` (or any non-ACGT byte) as a zero contribution. A
+/// full byte-indexed table preserves that, where the 4-constant [`RollConsts`]
+/// (which folds `N` into `G`) cannot. Only the ~15 meaningful bytes are
+/// computed; the rest stay `0`, which is exactly `srol_table(c, k)` for them. A
+/// debug assertion guards that the shortcut stays in sync with `MS_TAB_*`.
+pub fn build_srol_k(k: u16) -> Box<[u64; 256]> {
+    let d = k as u32;
+    let mut t = Box::new([0u64; 256]);
+    for &c in &SROL_NONZERO_BYTES {
+        t[c as usize] = srol_table(c, d);
+    }
+    debug_assert!(
+        (0..256).all(|c| t[c] == srol_table(c as u8, d)),
+        "SROL_NONZERO_BYTES is out of sync with MS_TAB_*"
+    );
+    t
+}
+
+/// Branchless 2-bit base code: folds A/C/G/T (and lowercase / RNA `U`) to
+/// `0..3`. Non-ACGT bytes are out of contract (callers gate on `N` first), so
+/// their code is unspecified — in particular `N` folds onto `G`, so this must
+/// not be used on inputs that may contain ambiguous bases.
+///
+/// The grouping matches the lookup tables exactly — `a`/`A` share a code and a
+/// seed, `t`/`T`/`u`/`U` share a code — so selecting a constant by code is
+/// identical to indexing `SEED_TAB`/`srol_table` by the raw byte for every
+/// in-contract base.
+#[inline(always)]
+pub fn base_code(b: u8) -> usize {
+    ((b >> 1) & 3) as usize
+}
+
+/// Per-base rolling constants for a fixed `k`, indexed by [`base_code`].
+///
+/// Supersedes the 256-entry `srol_k` table: only four distinct base
+/// contributions exist, so four constants per table (128 bytes total, held in
+/// registers) are selected by the 2-bit code. This is measurably faster in the
+/// roll hot-path than a variable-index load into a 2 KiB table, and — unlike
+/// the table — needs no heap allocation, which matters when a fresh hasher is
+/// built per short read.
+#[derive(Clone)]
+pub struct RollConsts {
+    /// `SEED_TAB[base]` — forward incoming contribution.
+    pub seed: [u64; 4],
+    /// `srol_table(base, k)` — forward outgoing contribution.
+    pub srolk: [u64; 4],
+    /// `srol_table(base & CP_OFF, k)` — reverse incoming contribution.
+    pub srolk_rc: [u64; 4],
+    /// `SEED_TAB[base & CP_OFF]` — reverse outgoing contribution.
+    pub seed_rc: [u64; 4],
+}
+
+impl RollConsts {
+    /// Precompute the four per-base constants for k-mer length `k`.
+    pub fn new(k: u16) -> Self {
+        let mut c = RollConsts {
+            seed: [0; 4],
+            srolk: [0; 4],
+            srolk_rc: [0; 4],
+            seed_rc: [0; 4],
+        };
+        for &b in b"ACGT" {
+            let i = base_code(b);
+            c.seed[i] = SEED_TAB[b as usize];
+            c.srolk[i] = srol_table(b, k as u32);
+            c.srolk_rc[i] = srol_table(b & CP_OFF, k as u32);
+            c.seed_rc[i] = SEED_TAB[(b & CP_OFF) as usize];
+        }
+        c
+    }
 }
 
 #[cfg(test)]

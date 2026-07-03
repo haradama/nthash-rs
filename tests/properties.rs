@@ -109,6 +109,24 @@ proptest! {
         }
     }
 
+    /// (1b) Purity holds across `N`-skips too: after `NtHash` resumes past an
+    /// ambiguous base, each emitted window still equals its isolated hash. This
+    /// guards the 4-constant roll path, which folds `N` onto `G` and so relies
+    /// on `N` being gated out of the roll body.
+    #[test]
+    fn purity_with_n(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..256),
+        k in 1u16..24,
+    ) {
+        prop_assume!((k as usize) <= seq.len());
+        let mut h = NtHash::new(&seq, k, 1, 0).unwrap();
+        while h.roll() {
+            let w = &seq[h.pos()..h.pos() + k as usize];
+            prop_assert_eq!(h.forward_hash(), base_forward_hash(w, k));
+            prop_assert_eq!(h.reverse_hash(), base_reverse_hash(w, k));
+        }
+    }
+
     /// (2) The canonical hash is invariant under reverse complement, and (3)
     /// forward/reverse hashes swap under reverse complement (strand symmetry).
     #[test]

@@ -25,9 +25,79 @@
 //! # Ok(()) }
 //! ```
 
-use std::collections::VecDeque;
+use crate::{kmer::NtHash, util::canonical, NtHashError, Result};
 
-use crate::{kmer::NtHash, NtHashError, Result};
+/// Monotonic ring-buffer deque of `(pos, hash)` candidates, hashes non-decreasing
+/// from front to back. The window holds at most `w` positions, plus one
+/// transient slot before the front is evicted, so a fixed `w + 1` capacity never
+/// overflows — no reallocation, no capacity checks, and index wrap-around by
+/// conditional subtraction (never a `%`) in the hot path.
+struct MonoWindow {
+    buf: Box<[(usize, u64)]>,
+    head: usize,
+    len: usize,
+}
+
+impl MonoWindow {
+    fn new(w: usize) -> Self {
+        Self {
+            buf: vec![(0usize, 0u64); w + 1].into_boxed_slice(),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    #[inline(always)]
+    fn front(&self) -> (usize, u64) {
+        self.buf[self.head]
+    }
+
+    #[inline(always)]
+    fn back(&self) -> (usize, u64) {
+        let cap = self.buf.len();
+        let mut i = self.head + self.len - 1;
+        if i >= cap {
+            i -= cap;
+        }
+        self.buf[i]
+    }
+
+    #[inline(always)]
+    fn push_back(&mut self, x: (usize, u64)) {
+        let cap = self.buf.len();
+        let mut i = self.head + self.len;
+        if i >= cap {
+            i -= cap;
+        }
+        self.buf[i] = x;
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    fn pop_back(&mut self) {
+        self.len -= 1;
+    }
+
+    #[inline(always)]
+    fn pop_front(&mut self) {
+        self.head += 1;
+        if self.head == self.buf.len() {
+            self.head = 0;
+        }
+        self.len -= 1;
+    }
+}
 
 /// A selected minimizer: the canonical hash and the start position of the
 /// k-mer that produced it.
@@ -78,7 +148,7 @@ impl<'a> MinimizerBuilder<'a> {
         Ok(Minimizers {
             hasher,
             w: self.w,
-            window: VecDeque::with_capacity(self.w),
+            window: MonoWindow::new(self.w),
             run_len: 0,
             prev_pos: None,
             last_emitted: None,
@@ -92,9 +162,8 @@ impl<'a> MinimizerBuilder<'a> {
 pub struct Minimizers<'a> {
     hasher: NtHash<'a>,
     w: usize,
-    /// Monotonic deque of `(pos, hash)` candidates, hashes non-decreasing from
-    /// front to back; the front is the current window's minimizer.
-    window: VecDeque<(usize, u64)>,
+    /// Monotonic window; the front is the current window's minimizer.
+    window: MonoWindow,
     /// Number of k-mers seen in the current gap-free run.
     run_len: usize,
     /// Position of the previously consumed k-mer, for gap detection.
@@ -103,16 +172,29 @@ pub struct Minimizers<'a> {
     last_emitted: Option<usize>,
 }
 
-impl Iterator for Minimizers<'_> {
-    type Item = Minimizer;
+impl Minimizers<'_> {
+    /// Drive the scan to completion, invoking `f` for each selected minimizer in
+    /// a single tight loop — no per-item `Iterator::next` boundary. Equivalent
+    /// to `for m in self { f(m) }` but measurably faster on long sequences.
+    #[inline]
+    pub fn for_each<F: FnMut(Minimizer)>(mut self, mut f: F) {
+        while let Some(m) = self.step() {
+            f(m);
+        }
+    }
 
-    fn next(&mut self) -> Option<Minimizer> {
+    /// Advance until the next minimizer is emitted (or the sequence ends).
+    /// Shared by [`for_each`](Self::for_each) and the [`Iterator`] impl.
+    #[inline(always)]
+    fn step(&mut self) -> Option<Minimizer> {
         loop {
             if !self.hasher.roll() {
                 return None;
             }
             let pos = self.hasher.pos();
-            let hash = self.hasher.hashes()[0];
+            // Compute the canonical hash from the strand hashes directly, rather
+            // than reading it back out of the hasher's heap `hashes` buffer.
+            let hash = canonical(self.hasher.forward_hash(), self.hasher.reverse_hash());
 
             // An `N`-skip makes positions non-contiguous; reset the window so a
             // minimizer never spans an ambiguous base.
@@ -125,30 +207,22 @@ impl Iterator for Minimizers<'_> {
 
             // Maintain the monotonic deque. Pop strictly-greater tails so that,
             // on ties, the leftmost (earliest) k-mer is retained as minimizer.
-            while let Some(&(_, back_hash)) = self.window.back() {
-                if back_hash > hash {
-                    self.window.pop_back();
-                } else {
-                    break;
-                }
+            while !self.window.is_empty() && self.window.back().1 > hash {
+                self.window.pop_back();
             }
             self.window.push_back((pos, hash));
             self.run_len += 1;
 
             // Evict the front once it falls outside the window of the last `w`
             // k-mer positions (`front_pos <= pos - w`).
-            while let Some(&(front_pos, _)) = self.window.front() {
-                if front_pos + self.w <= pos {
-                    self.window.pop_front();
-                } else {
-                    break;
-                }
+            while self.window.front().0 + self.w <= pos {
+                self.window.pop_front();
             }
 
             // Emit the window minimizer once a full window exists, skipping
             // repeats of the same occurrence.
             if self.run_len >= self.w {
-                let (mpos, mhash) = *self.window.front().expect("window is non-empty");
+                let (mpos, mhash) = self.window.front();
                 if self.last_emitted != Some(mpos) {
                     self.last_emitted = Some(mpos);
                     return Some(Minimizer {
@@ -158,6 +232,15 @@ impl Iterator for Minimizers<'_> {
                 }
             }
         }
+    }
+}
+
+impl Iterator for Minimizers<'_> {
+    type Item = Minimizer;
+
+    #[inline]
+    fn next(&mut self) -> Option<Minimizer> {
+        self.step()
     }
 }
 

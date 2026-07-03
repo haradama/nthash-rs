@@ -31,56 +31,14 @@
 //! ```
 
 use crate::{
-    constants::{CP_OFF, SEED_TAB},
     kmer::{base_forward_hash, base_reverse_hash},
-    tables::{srol, sror},
+    tables::{base_code, srol, sror, RollConsts},
     util::canonical,
     NtHashError, Result,
 };
 
 /// Number of reads processed per SIMD lane group (AVX2 = 4×u64).
 const LANES: usize = 4;
-
-/// 2-bit base code, shared by the scalar and SIMD paths.
-///
-/// `(b >> 1) & 3` maps A/C/G/T (and their lowercase / RNA `U`) to a stable code
-/// with no branches. Ambiguous bases are out of contract (N-free input), so
-/// their code is unspecified — matching [`BlindNtHash`](crate::blind).
-#[inline(always)]
-fn base_code(b: u8) -> usize {
-    ((b >> 1) & 3) as usize
-}
-
-/// The four per-base constants needed to roll a hash, indexed by [`base_code`].
-struct Consts {
-    /// `SEED_TAB[base]` — forward incoming contribution.
-    seed: [u64; 4],
-    /// `srol_table(base, k)` — forward outgoing contribution.
-    srolk: [u64; 4],
-    /// `srol_table(base & CP_OFF, k)` — reverse incoming contribution.
-    srolk_rc: [u64; 4],
-    /// `SEED_TAB[base & CP_OFF]` — reverse outgoing contribution.
-    seed_rc: [u64; 4],
-}
-
-impl Consts {
-    fn new(k: u16) -> Self {
-        let mut c = Consts {
-            seed: [0; 4],
-            srolk: [0; 4],
-            srolk_rc: [0; 4],
-            seed_rc: [0; 4],
-        };
-        for &b in b"ACGT" {
-            let i = base_code(b);
-            c.seed[i] = SEED_TAB[b as usize];
-            c.srolk[i] = crate::tables::srol_table(b, k as u32);
-            c.srolk_rc[i] = crate::tables::srol_table(b & CP_OFF, k as u32);
-            c.seed_rc[i] = SEED_TAB[(b & CP_OFF) as usize];
-        }
-        c
-    }
-}
 
 /// Batch hasher for many equal-length, N-free reads.
 ///
@@ -89,7 +47,7 @@ impl Consts {
 /// k-mer via a callback, allocating nothing per k-mer.
 pub struct ReadHasher {
     k: u16,
-    consts: Consts,
+    consts: RollConsts,
 }
 
 impl ReadHasher {
@@ -100,7 +58,7 @@ impl ReadHasher {
         }
         Ok(Self {
             k,
-            consts: Consts::new(k),
+            consts: RollConsts::new(k),
         })
     }
 
