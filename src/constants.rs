@@ -375,7 +375,7 @@ const fn build_tab31() -> [&'static [u64; 31]; ASCII_SIZE] {
     t
 }
 /// Final 31‑bit split‑rotate lookup table.
-pub const MS_TAB_31L: [&'static [u64; 31]; ASCII_SIZE] = build_tab31();
+pub const MS_TAB_31L: [&[u64; 31]; ASCII_SIZE] = build_tab31();
 
 /// Build the 33‑bit rotation table array for all ASCII codes.
 const fn build_tab33() -> [&'static [u64; 33]; ASCII_SIZE] {
@@ -400,7 +400,7 @@ const fn build_tab33() -> [&'static [u64; 33]; ASCII_SIZE] {
     t
 }
 /// Final 33‑bit split‑rotate lookup table.
-pub const MS_TAB_33R: [&'static [u64; 33]; ASCII_SIZE] = build_tab33();
+pub const MS_TAB_33R: [&[u64; 33]; ASCII_SIZE] = build_tab33();
 
 //==============================================================================
 // Pre‑hashed tables for small k‑mers (2‑,3‑,4‑mers).
@@ -751,7 +751,7 @@ pub const TETRAMER_TAB: [u64; 256] = [
     0x81de_0028_7299_bf36,
     0x8cc6_3a1e_85ff_900e,
     0x9d67_c54b_6508_9866,
-    0x9400_b26e_acbd_ff14,    
+    0x9400_b26e_acbd_ff14,
 ];
 
 //==============================================================================

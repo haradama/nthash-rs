@@ -1,0 +1,29 @@
+# cargo-fuzz harness for nthash-rs. Kept as a separate workspace so the main
+# crate's `cargo build` / `cargo test` / `cargo publish` are unaffected.
+#
+# Run a campaign (requires nightly + `cargo install cargo-fuzz`):
+#   cargo +nightly fuzz run fuzz_nthash
+[package]
+name = "nthash-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.nthash-rs]
+path = ".."
+
+[[bin]]
+name = "fuzz_nthash"
+path = "fuzz_targets/fuzz_nthash.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

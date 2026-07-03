@@ -10,6 +10,8 @@ homepage         = "https://github.com/haradama/nthash-rs"
 keywords         = ["bioinformatics", "k-mer", "dna", "hash", "rolling-hash"]
 categories       = ["science::bioinformatics::genomics", "science::bioinformatics::sequence-analysis"]
 authors          = ["haradama <harada@sfc.wide.ad.jp>"]
+# The cargo-fuzz harness is a dev-only separate workspace; keep it out of the package.
+exclude          = ["fuzz"]
 
 [dependencies]
 thiserror   = "2.0.12"
@@ -19,6 +21,7 @@ ahash = "0.8.12"
 criterion = "0.5.1"
 fnv = "1.0.7"
 fxhash = "0.2.1"
+proptest = "1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [[bench]]

@@ -37,6 +37,25 @@ pub struct NtHash<'a> {
     fwd_hash: u64,
     rev_hash: u64,
     hashes: Vec<u64>,
+    /// Precomputed `srol_table(c, k)` for every byte value `c`.
+    ///
+    /// `k` is fixed for the lifetime of the hasher, so the split‑rotate of each
+    /// base's seed by `k` is constant. Caching it here turns the two
+    /// `srol_table` calls in the roll hot‑path (each a pair of `% 31` / `% 33`
+    /// reductions plus a pointer‑chase through `MS_TAB_*`) into a single direct
+    /// array load.
+    srol_k: Box<[u64; 256]>,
+}
+
+/// Build the `srol_table(c, k)` lookup for every byte value `c`.
+#[inline]
+fn build_srol_k(k: u16) -> Box<[u64; 256]> {
+    let mut t = Box::new([0u64; 256]);
+    let d = k as u32;
+    for (c, slot) in t.iter_mut().enumerate() {
+        *slot = srol_table(c as u8, d);
+    }
+    t
 }
 
 impl<'a> NtHash<'a> {
@@ -65,13 +84,14 @@ impl<'a> NtHash<'a> {
             return Err(NtHashError::PositionOutOfRange { pos, seq_len: len });
         }
         Ok(Self {
-            seq: seq,
+            seq,
             k,
             pos,
             initialized: false,
             fwd_hash: 0,
             rev_hash: 0,
             hashes: vec![0; num_hashes as usize],
+            srol_k: build_srol_k(k),
         })
     }
 
@@ -91,8 +111,8 @@ impl<'a> NtHash<'a> {
             return self.init();
         }
         let outgoing = self.seq[self.pos];
-        self.fwd_hash = next_forward_hash(self.fwd_hash, self.k, outgoing, incoming);
-        self.rev_hash = next_reverse_hash(self.rev_hash, self.k, outgoing, incoming);
+        self.fwd_hash = next_forward_hash(&self.srol_k, self.fwd_hash, outgoing, incoming);
+        self.rev_hash = next_reverse_hash(&self.srol_k, self.rev_hash, outgoing, incoming);
         self.update_hashes();
         self.pos += 1;
         true
@@ -115,8 +135,8 @@ impl<'a> NtHash<'a> {
             return self.init();
         }
         let outgoing = self.seq[self.pos + self.k as usize - 1];
-        self.fwd_hash = prev_forward_hash(self.fwd_hash, self.k, outgoing, incoming);
-        self.rev_hash = prev_reverse_hash(self.rev_hash, self.k, outgoing, incoming);
+        self.fwd_hash = prev_forward_hash(&self.srol_k, self.fwd_hash, outgoing, incoming);
+        self.rev_hash = prev_reverse_hash(&self.srol_k, self.rev_hash, outgoing, incoming);
         self.update_hashes();
         self.pos -= 1;
         true
@@ -140,8 +160,8 @@ impl<'a> NtHash<'a> {
             return false;
         }
         let outgoing = self.seq[self.pos];
-        let fwd = next_forward_hash(self.fwd_hash, self.k, outgoing, incoming);
-        let rev = next_reverse_hash(self.rev_hash, self.k, outgoing, incoming);
+        let fwd = next_forward_hash(&self.srol_k, self.fwd_hash, outgoing, incoming);
+        let rev = next_reverse_hash(&self.srol_k, self.rev_hash, outgoing, incoming);
         self.fill_hash_buffer(fwd, rev);
         true
     }
@@ -164,8 +184,8 @@ impl<'a> NtHash<'a> {
             return false;
         }
         let outgoing = self.seq[self.pos + self.k as usize - 1];
-        let fwd = prev_forward_hash(self.fwd_hash, self.k, outgoing, incoming);
-        let rev = prev_reverse_hash(self.rev_hash, self.k, outgoing, incoming);
+        let fwd = prev_forward_hash(&self.srol_k, self.fwd_hash, outgoing, incoming);
+        let rev = prev_reverse_hash(&self.srol_k, self.rev_hash, outgoing, incoming);
         self.fill_hash_buffer(fwd, rev);
         true
     }
@@ -320,32 +340,32 @@ pub fn base_reverse_hash(seq: &[u8], k: u16) -> u64 {
 }
 
 #[inline(always)]
-fn next_forward_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
+fn next_forward_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
     let mut h = srol(prev);
     h ^= SEED_TAB[char_in as usize];
-    h ^= srol_table(char_out, k as u32);
+    h ^= srol_k[char_out as usize];
     h
 }
 
 #[inline(always)]
-fn prev_forward_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
-    let mut h = prev ^ srol_table(char_in, k as u32);
+fn prev_forward_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+    let mut h = prev ^ srol_k[char_in as usize];
     h ^= SEED_TAB[char_out as usize];
     sror(h)
 }
 
 #[inline(always)]
-fn next_reverse_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
-    let mut h = prev ^ srol_table(char_in & CP_OFF, k as u32);
+fn next_reverse_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+    let mut h = prev ^ srol_k[(char_in & CP_OFF) as usize];
     h ^= SEED_TAB[(char_out & CP_OFF) as usize];
     sror(h)
 }
 
 #[inline(always)]
-fn prev_reverse_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
+fn prev_reverse_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
     let mut h = srol(prev);
     h ^= SEED_TAB[(char_in & CP_OFF) as usize];
-    h ^= srol_table(char_out & CP_OFF, k as u32);
+    h ^= srol_k[(char_out & CP_OFF) as usize];
     h
 }
 
@@ -404,6 +424,38 @@ impl<'a> NtHashBuilder<'a> {
 pub struct NtHashIter<'a> {
     hasher: NtHash<'a>,
     done: bool,
+}
+
+impl<'a> NtHashIter<'a> {
+    /// Drive the hasher to completion, invoking `f(pos, &hashes)` for each
+    /// valid k‑mer **without allocating**.
+    ///
+    /// The [`Iterator`] impl yields an owned `Vec<u64>` per k‑mer, which means
+    /// one heap allocation for every window — the dominant cost when hashing
+    /// long sequences. This method instead lends the hasher's internal buffer
+    /// to `f`, so the whole traversal allocates nothing. Prefer it whenever the
+    /// hashes are consumed immediately rather than collected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use nthash_rs::NtHashBuilder;
+    /// # fn main() -> nthash_rs::Result<()> {
+    /// let mut count = 0usize;
+    /// NtHashBuilder::new(b"ACGTACGTACGT").k(4).finish()?
+    ///     .for_each_hash(|_pos, hashes| count += hashes.len());
+    /// assert!(count > 0);
+    /// # Ok(()) }
+    /// ```
+    #[inline]
+    pub fn for_each_hash<F: FnMut(usize, &[u64])>(mut self, mut f: F) {
+        if self.done {
+            return;
+        }
+        while self.hasher.roll() {
+            f(self.hasher.pos(), self.hasher.hashes());
+        }
+    }
 }
 
 impl<'a> Iterator for NtHashIter<'a> {

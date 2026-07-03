@@ -21,7 +21,7 @@ use crate::{
 
 /// Parses a spaced-seed mask string composed of '0' and '1' characters
 /// into a list of indices indicating which positions should be used ("care positions").
-/// 
+///
 /// # Errors
 /// Returns an error if the mask length does not match `k`, or contains characters other than '0' or '1'.
 fn parse_seed_string(mask: &str, k: usize) -> Result<Vec<usize>> {
@@ -39,12 +39,12 @@ fn parse_seed_string(mask: &str, k: usize) -> Result<Vec<usize>> {
 }
 
 /// Computes the forward and reverse hash values for a given k-mer using a spaced seed.
-/// 
+///
 /// # Arguments
 /// - `window`: The current k-mer slice from the sequence.
 /// - `care`: The positions to include in hashing (as defined by the spaced seed).
 /// - `k`: Length of the k-mer.
-/// 
+///
 /// # Returns
 /// A tuple of (forward_hash, reverse_hash).
 #[inline]
@@ -64,18 +64,18 @@ fn compute_pair(window: &[u8], care: &[usize], k: usize) -> (u64, u64) {
 /// Struct for computing spaced-seed ntHash values in a re-computational manner.
 /// Can handle multiple seeds and generates multiple hashes per k-mer.
 pub struct SeedNtHash<'a> {
-    seq:      &'a [u8],        // Input nucleotide sequence
-    k:        usize,           // k-mer size
-    num_hashes: usize,         // Number of hashes per seed
-    seeds:    Vec<Vec<usize>>, // Care indices for each seed
-    pos:      usize,           // Current position in the sequence
-    hashes:   Vec<u64>,        // Hash results (flattened)
-    initialised: bool,         // Whether the hasher has found the first valid k-mer
+    seq: &'a [u8],          // Input nucleotide sequence
+    k: usize,               // k-mer size
+    num_hashes: usize,      // Number of hashes per seed
+    seeds: Vec<Vec<usize>>, // Care indices for each seed
+    pos: usize,             // Current position in the sequence
+    hashes: Vec<u64>,       // Hash results (flattened)
+    initialised: bool,      // Whether the hasher has found the first valid k-mer
 }
 
 impl<'a> SeedNtHash<'a> {
     /// Creates a new hasher from a sequence and spaced-seed masks.
-    /// 
+    ///
     /// # Errors
     /// Returns an error if `k` is zero, the sequence is too short, or a mask is invalid.
     pub fn new(
@@ -157,17 +157,23 @@ impl<'a> SeedNtHash<'a> {
 
     /// Advances the iterator by one position.
     /// On first call, searches for the first valid k-mer (initialization).
+    ///
+    /// Windows containing an ambiguous base at a care position are **skipped**
+    /// (the position advances to the next valid k-mer), matching the behaviour
+    /// of the contiguous [`NtHash`](crate::kmer::NtHash). `false` is returned
+    /// only when the end of the sequence is reached.
     pub fn roll(&mut self) -> bool {
         if !self.initialised {
             return self.init();
         }
 
-        if self.pos >= self.seq.len() - self.k {
-            return false; // End of sequence
+        while self.pos < self.seq.len() - self.k {
+            self.pos += 1;
+            if self.compute_current() {
+                return true;
+            }
         }
-
-        self.pos += 1;
-        self.compute_current()
+        false // End of sequence
     }
 
     /// Computes hashes for the k-mer at the current position.
@@ -182,8 +188,7 @@ impl<'a> SeedNtHash<'a> {
 
         for (i_seed, care) in self.seeds.iter().enumerate() {
             let (fwd, rev) = compute_pair(win, care, self.k);
-            let slice = &mut self.hashes[i_seed * self.num_hashes
-                ..(i_seed + 1) * self.num_hashes];
+            let slice = &mut self.hashes[i_seed * self.num_hashes..(i_seed + 1) * self.num_hashes];
             extend_hashes(fwd, rev, self.k as u32, slice);
         }
         true
@@ -226,11 +231,11 @@ impl<'a> SeedNtHash<'a> {
 /// # Ok(()) }
 /// ```
 pub struct SeedNtHashBuilder<'a> {
-    seq:        &'a [u8],
-    masks:      Vec<String>,
-    k:          u16,
+    seq: &'a [u8],
+    masks: Vec<String>,
+    k: u16,
     num_hashes: usize,
-    start_pos:  usize,
+    start_pos: usize,
 }
 
 impl<'a> SeedNtHashBuilder<'a> {
@@ -278,14 +283,36 @@ impl<'a> SeedNtHashBuilder<'a> {
             self.k,
             self.start_pos,
         )?;
-        Ok(SeedNtHashIter { hasher, done: false })
+        Ok(SeedNtHashIter {
+            hasher,
+            done: false,
+        })
     }
 }
 
 /// Iterator for traversing valid k-mers and yielding spaced-seed hashes.
 pub struct SeedNtHashIter<'a> {
     hasher: SeedNtHash<'a>,
-    done:   bool,
+    done: bool,
+}
+
+impl<'a> SeedNtHashIter<'a> {
+    /// Drive the hasher to completion, invoking `f(pos, &hashes)` for each
+    /// valid k‑mer **without allocating**.
+    ///
+    /// The [`Iterator`] impl yields an owned `Vec<u64>` per k‑mer (one heap
+    /// allocation each); this method lends the internal buffer to `f` instead,
+    /// so the traversal allocates nothing. Traversal stops at the first window
+    /// with an ambiguous base at a care position, mirroring the [`Iterator`].
+    #[inline]
+    pub fn for_each_hash<F: FnMut(usize, &[u64])>(mut self, mut f: F) {
+        if self.done {
+            return;
+        }
+        while self.hasher.roll() {
+            f(self.hasher.pos(), self.hasher.hashes());
+        }
+    }
 }
 
 impl<'a> Iterator for SeedNtHashIter<'a> {
@@ -329,5 +356,37 @@ mod tests {
         let first = h.hashes()[0];
         assert!(h.roll()); // next valid
         assert_ne!(first, h.hashes()[0]); // hashes should differ
+    }
+
+    /// A mid-sequence `N` at a care position must be **skipped**, not treated as
+    /// end-of-sequence. This mirrors the contiguous `NtHash`, which resumes
+    /// after the ambiguous window.
+    #[test]
+    fn skips_ambiguous_windows_and_resumes() {
+        // 'N' at index 8; valid 4-mers exist both before and after it.
+        let seq = b"ACGTACGTNACGTACGTACGT";
+        let k = 4u16;
+
+        // Reference set of valid start positions = what the contiguous hasher emits.
+        let expected: Vec<usize> = crate::NtHashBuilder::new(seq)
+            .k(k)
+            .finish()
+            .unwrap()
+            .map(|(p, _)| p)
+            .collect();
+
+        // All-care mask ("1111") makes each spaced window equal the contiguous one.
+        let got: Vec<usize> = SeedNtHashBuilder::new(seq)
+            .k(k)
+            .masks(vec!["1111".to_string()])
+            .finish()
+            .unwrap()
+            .map(|(p, _)| p)
+            .collect();
+
+        assert_eq!(
+            got, expected,
+            "SeedNtHash must skip N-windows and resume, like NtHash"
+        );
     }
 }

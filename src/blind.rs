@@ -40,13 +40,29 @@ pub struct BlindNtHash {
     fwd_hash: u64,
     rev_hash: u64,
     hashes: Vec<u64>,
+    /// Precomputed `srol_table(c, k)` for every byte value `c`; see
+    /// [`crate::kmer`] for the rationale. `k` is fixed for the hasher's
+    /// lifetime, so this collapses the two `srol_table` calls per roll (each a
+    /// `% 31` / `% 33` reduction plus a `MS_TAB_*` pointer‑chase) into one load.
+    srol_k: Box<[u64; 256]>,
+}
+
+/// Build the `srol_table(c, k)` lookup for every byte value `c`.
+#[inline]
+fn build_srol_k(k: u16) -> Box<[u64; 256]> {
+    let mut t = Box::new([0u64; 256]);
+    let d = k as u32;
+    for (c, slot) in t.iter_mut().enumerate() {
+        *slot = srol_table(c as u8, d);
+    }
+    t
 }
 
 impl BlindNtHash {
     /// Create a new `BlindNtHash` whose initial window is `seq[pos..pos+k]`.
     ///
-    /// * The caller must guarantee* that the slice contains **no ambiguous
-    /// bases ('N')** – the blind variant will not skip over invalid windows.
+    /// The caller must guarantee that the slice contains **no ambiguous bases
+    /// ('N')** – the blind variant will not skip over invalid windows.
     ///
     /// # Errors
     ///
@@ -57,6 +73,11 @@ impl BlindNtHash {
         }
         let len = seq.len();
         let k_usz = k as usize;
+
+        // Guard before `len - k_usz` below, which would otherwise underflow.
+        if len < k_usz {
+            return Err(NtHashError::SequenceTooShort { seq_len: len, k });
+        }
 
         if pos < 0 || (pos as usize) > len - k_usz {
             return Err(NtHashError::PositionOutOfRange {
@@ -82,6 +103,7 @@ impl BlindNtHash {
             fwd_hash,
             rev_hash,
             hashes,
+            srol_k: build_srol_k(k),
         })
     }
 
@@ -93,8 +115,8 @@ impl BlindNtHash {
             .expect("window length is always k > 0");
         self.window.push_back(char_in);
 
-        self.fwd_hash = next_forward_hash(self.fwd_hash, self.k, char_out, char_in);
-        self.rev_hash = next_reverse_hash(self.rev_hash, self.k, char_out, char_in);
+        self.fwd_hash = next_forward_hash(&self.srol_k, self.fwd_hash, char_out, char_in);
+        self.rev_hash = next_reverse_hash(&self.srol_k, self.rev_hash, char_out, char_in);
         extend_hashes(
             self.fwd_hash,
             self.rev_hash,
@@ -113,8 +135,8 @@ impl BlindNtHash {
             .expect("window length is always k > 0");
         self.window.push_front(char_in);
 
-        self.fwd_hash = prev_forward_hash(self.fwd_hash, self.k, char_out, char_in);
-        self.rev_hash = prev_reverse_hash(self.rev_hash, self.k, char_out, char_in);
+        self.fwd_hash = prev_forward_hash(&self.srol_k, self.fwd_hash, char_out, char_in);
+        self.rev_hash = prev_reverse_hash(&self.srol_k, self.rev_hash, char_out, char_in);
         extend_hashes(
             self.fwd_hash,
             self.rev_hash,
@@ -128,15 +150,15 @@ impl BlindNtHash {
     /// Compute hashes for the **next** window without mutating `self`.
     pub fn peek(&mut self, char_in: u8) {
         let char_out = *self.window.front().unwrap();
-        let fwd = next_forward_hash(self.fwd_hash, self.k, char_out, char_in);
-        let rev = next_reverse_hash(self.rev_hash, self.k, char_out, char_in);
+        let fwd = next_forward_hash(&self.srol_k, self.fwd_hash, char_out, char_in);
+        let rev = next_reverse_hash(&self.srol_k, self.rev_hash, char_out, char_in);
         extend_hashes(fwd, rev, self.k as u32, &mut self.hashes);
     }
 
     pub fn peek_back(&mut self, char_in: u8) {
         let char_out = *self.window.back().unwrap();
-        let fwd = prev_forward_hash(self.fwd_hash, self.k, char_out, char_in);
-        let rev = prev_reverse_hash(self.rev_hash, self.k, char_out, char_in);
+        let fwd = prev_forward_hash(&self.srol_k, self.fwd_hash, char_out, char_in);
+        let rev = prev_reverse_hash(&self.srol_k, self.rev_hash, char_out, char_in);
         extend_hashes(fwd, rev, self.k as u32, &mut self.hashes);
     }
 
@@ -162,23 +184,23 @@ impl BlindNtHash {
 }
 
 #[inline(always)]
-fn next_forward_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
-    srol(prev) ^ SEED_TAB[char_in as usize] ^ srol_table(char_out, k as u32)
+fn next_forward_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+    srol(prev) ^ SEED_TAB[char_in as usize] ^ srol_k[char_out as usize]
 }
 
 #[inline(always)]
-fn prev_forward_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
-    sror(prev ^ srol_table(char_in, k as u32) ^ SEED_TAB[char_out as usize])
+fn prev_forward_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+    sror(prev ^ srol_k[char_in as usize] ^ SEED_TAB[char_out as usize])
 }
 
 #[inline(always)]
-fn next_reverse_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
-    sror(prev ^ srol_table(char_in & CP_OFF, k as u32) ^ SEED_TAB[(char_out & CP_OFF) as usize])
+fn next_reverse_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+    sror(prev ^ srol_k[(char_in & CP_OFF) as usize] ^ SEED_TAB[(char_out & CP_OFF) as usize])
 }
 
 #[inline(always)]
-fn prev_reverse_hash(prev: u64, k: u16, char_out: u8, char_in: u8) -> u64 {
-    srol(prev) ^ SEED_TAB[(char_in & CP_OFF) as usize] ^ srol_table(char_out & CP_OFF, k as u32)
+fn prev_reverse_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+    srol(prev) ^ SEED_TAB[(char_in & CP_OFF) as usize] ^ srol_k[(char_out & CP_OFF) as usize]
 }
 
 pub struct BlindNtHashBuilder<'a> {
@@ -232,6 +254,29 @@ pub struct BlindNtHashIter<'a> {
     first: bool,
 }
 
+impl<'a> BlindNtHashIter<'a> {
+    /// Drive the hasher to completion, invoking `f(pos, &hashes)` for each
+    /// window **without allocating**.
+    ///
+    /// The [`Iterator`] impl yields an owned `Vec<u64>` per window (one heap
+    /// allocation each); this method lends the internal buffer to `f` instead,
+    /// so the traversal allocates nothing. See
+    /// [`NtHashIter::for_each_hash`](crate::kmer::NtHashIter::for_each_hash).
+    #[inline]
+    pub fn for_each_hash<F: FnMut(usize, &[u64])>(mut self, mut f: F) {
+        if self.first {
+            self.first = false;
+            f(self.hasher.pos() as usize, self.hasher.hashes());
+        }
+        while (self.hasher.pos() as usize) < self.end {
+            let cur = self.hasher.pos() as usize;
+            let incoming = self.seq[cur + self.hasher.k as usize];
+            self.hasher.roll(incoming);
+            f(self.hasher.pos() as usize, self.hasher.hashes());
+        }
+    }
+}
+
 impl<'a> Iterator for BlindNtHashIter<'a> {
     type Item = (usize, Vec<u64>);
 
@@ -260,5 +305,18 @@ impl<'a> IntoIterator for BlindNtHashBuilder<'a> {
     fn into_iter(self) -> Self::IntoIter {
         self.finish()
             .expect("invalid BlindNtHashBuilder configuration")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn too_short_sequence_errors_without_panicking() {
+        match BlindNtHash::new(b"ACG", 4, 1, 0) {
+            Err(NtHashError::SequenceTooShort { seq_len: 3, k: 4 }) => {}
+            other => panic!("expected SequenceTooShort, got {:?}", other.map(|_| ())),
+        }
     }
 }

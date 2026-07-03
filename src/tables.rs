@@ -218,15 +218,15 @@ mod tests {
         //   64  (large)     – large rotation to force multi‑wrap behavior
 
         // PICT-generated (c, d) → expected
-        assert_eq!(srol_table(0, 0),  0x0000_0000_0000_0000);
+        assert_eq!(srol_table(0, 0), 0x0000_0000_0000_0000);
         assert_eq!(srol_table(3, 32), 0x4064_7DA0_412B_9192);
-        assert_eq!(srol_table(4, 0),  0x3C8B_FBB3_95C6_0474);
-        assert_eq!(srol_table(1, 0),  0x2955_49F5_4BE2_4456);
-        assert_eq!(srol_table(7, 1),  0x6327_8308_C540_5699);
+        assert_eq!(srol_table(4, 0), 0x3C8B_FBB3_95C6_0474);
+        assert_eq!(srol_table(1, 0), 0x2955_49F5_4BE2_4456);
+        assert_eq!(srol_table(7, 1), 0x6327_8308_C540_5699);
         assert_eq!(srol_table(1, 33), 0xA555_27D1_4BE2_4456);
         assert_eq!(srol_table(4, 33), 0xF22F_EEC9_95C6_0474);
         assert_eq!(srol_table(4, 30), 0x9E45_FDD9_32B8_C08E);
-        assert_eq!(srol_table(0, 1),  0x0000_0000_0000_0000);
+        assert_eq!(srol_table(0, 1), 0x0000_0000_0000_0000);
         assert_eq!(srol_table(0, 31), 0x0000_0000_0000_0000);
         assert_eq!(srol_table(7, 33), 0xC64F_0611_62A0_2B4C);
         assert_eq!(srol_table(1, 64), 0xA555_27D1_52F8_9115);
@@ -234,21 +234,21 @@ mod tests {
         assert_eq!(srol_table(0, 32), 0x0000_0000_0000_0000);
         assert_eq!(srol_table(3, 64), 0x80C8_FB40_2095_C8C9);
         assert_eq!(srol_table(7, 30), 0x18C9_E0C3_2C54_0569);
-        assert_eq!(srol_table(7, 0),  0x3193_C185_62A0_2B4C);
-        assert_eq!(srol_table(1, 1),  0x52AA_93E8_97C4_88AD);
-        assert_eq!(srol_table(3, 0),  0x2032_3ED0_8257_2324);
+        assert_eq!(srol_table(7, 0), 0x3193_C185_62A0_2B4C);
+        assert_eq!(srol_table(1, 1), 0x52AA_93E8_97C4_88AD);
+        assert_eq!(srol_table(3, 0), 0x2032_3ED0_8257_2324);
         assert_eq!(srol_table(4, 64), 0xF22F_EEC8_6571_811D);
         assert_eq!(srol_table(4, 31), 0x3C8B_FBB2_6571_811D);
         assert_eq!(srol_table(3, 33), 0x80C8_FB40_8257_2324);
         assert_eq!(srol_table(0, 30), 0x0000_0000_0000_0000);
         assert_eq!(srol_table(0, 64), 0x0000_0000_0000_0000);
         assert_eq!(srol_table(7, 31), 0x3193_C184_58A8_0AD3);
-        assert_eq!(srol_table(4, 1),  0x7917_F765_2B8C_08E9);
+        assert_eq!(srol_table(4, 1), 0x7917_F765_2B8C_08E9);
         assert_eq!(srol_table(3, 31), 0x2032_3ED0_2095_C8C9);
         assert_eq!(srol_table(1, 30), 0x14AA_A4FB_A97C_488A);
         assert_eq!(srol_table(1, 32), 0x52AA_93E8_A5F1_222B);
         assert_eq!(srol_table(7, 32), 0x6327_8308_B150_15A6);
-        assert_eq!(srol_table(3, 1),  0x4064_7DA1_04AE_4648);
+        assert_eq!(srol_table(3, 1), 0x4064_7DA1_04AE_4648);
         assert_eq!(srol_table(7, 64), 0xC64F_0610_58A8_0AD3);
         assert_eq!(srol_table(4, 32), 0x7917_F764_CAE3_023A);
         assert_eq!(srol_table(3, 30), 0x1019_1F69_104A_E464);

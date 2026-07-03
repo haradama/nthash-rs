@@ -50,7 +50,7 @@ pub const fn canonical(fwd: u64, rev: u64) -> u64 {
 /// - `fwd`, `rev`  - forward and reverse‐complement strand hashes.
 /// - `k`           - k‑mer span or seed weight, used in the mixing step.
 /// - `hashes`      - output slice; the length determines how many values
-///                   (including the canonical hash at index 0) are generated.
+///   (including the canonical hash at index 0) are generated.
 ///
 /// If `hashes` is empty, this function returns immediately, avoiding any
 /// unnecessary branching in callers.
@@ -115,7 +115,7 @@ mod tests {
         let mut v = [0u64; 8];
         extend_hashes(F, R, K, &mut v);
         let base = F.wrapping_add(R);
-        for i in 0..v.len() {
+        for (i, &got) in v.iter().enumerate() {
             let expected = if i == 0 {
                 base
             } else {
@@ -123,7 +123,7 @@ mod tests {
                 t ^= t >> MULTISHIFT;
                 t
             };
-            assert_eq!(v[i], expected);
+            assert_eq!(got, expected);
         }
     }
 }

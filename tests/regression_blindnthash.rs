@@ -64,5 +64,3 @@ fn regression_simple_nthash() {
         );
     }
 }
-
-
