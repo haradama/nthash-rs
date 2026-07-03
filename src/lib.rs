@@ -47,6 +47,8 @@ pub mod blind;
 /// High‑level contiguous k‑mer rolling hasher.
 /// Skips over non‑ACGT bases exactly as the original reference.
 pub mod kmer;
+/// Canonical (w, k)-minimizers built on the contiguous rolling hasher.
+pub mod minimizer;
 pub mod seed;
 pub mod util;
 
@@ -78,6 +80,10 @@ pub use blind::BlindNtHashBuilder;
 pub use seed::SeedNtHash;
 pub use seed::SeedNtHashBuilder;
 
+pub use minimizer::Minimizer;
+pub use minimizer::MinimizerBuilder;
+pub use minimizer::Minimizers;
+
 // --------------------------------------------------------------------------
 // Crate‑wide result and error types
 // --------------------------------------------------------------------------
@@ -91,6 +97,10 @@ pub enum NtHashError {
     /// `k` was zero.
     #[error("k must be > 0")]
     InvalidK,
+
+    /// Minimizer window `w` was zero.
+    #[error("w must be > 0")]
+    InvalidW,
 
     /// Provided sequence length is shorter than `k`.
     #[error("sequence length ({seq_len}) < k ({k})")]

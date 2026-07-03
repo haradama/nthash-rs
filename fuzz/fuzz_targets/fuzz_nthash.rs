@@ -19,6 +19,7 @@ struct Input {
     num_hashes: u8,
     pos: u32,
     mask: String,
+    w: u16,
 }
 
 fuzz_target!(|input: Input| {
@@ -28,6 +29,7 @@ fuzz_target!(|input: Input| {
         num_hashes,
         pos,
         mask,
+        w,
     } = input;
     let pos = pos as usize;
     // A hard backstop on iteration count: roll() advances position monotonically,
@@ -63,6 +65,22 @@ fuzz_target!(|input: Input| {
         while h.roll() && n < budget {
             n += 1;
             std::hint::black_box(h.hashes());
+        }
+    }
+
+    // Canonical (w, k)-minimizers over the same input.
+    if let Ok(mins) = nthash_rs::MinimizerBuilder::new(&seq)
+        .k(k)
+        .w(w as usize)
+        .finish()
+    {
+        let mut n = 0;
+        for m in mins {
+            std::hint::black_box(m);
+            n += 1;
+            if n >= budget {
+                break;
+            }
         }
     }
 });

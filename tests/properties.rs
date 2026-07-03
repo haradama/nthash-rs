@@ -24,9 +24,10 @@
 use nthash_rs::{
     canonical,
     kmer::{base_forward_hash, base_reverse_hash},
-    BlindNtHash, NtHash, SeedNtHash,
+    BlindNtHash, MinimizerBuilder, NtHash, NtHashBuilder, SeedNtHash,
 };
 use proptest::prelude::*;
+use std::collections::HashSet;
 
 /// Reverse complement of an A/C/G/T sequence.
 fn revcomp(s: &[u8]) -> Vec<u8> {
@@ -48,6 +49,47 @@ fn seq_and_k() -> impl Strategy<Value = (Vec<u8>, u16)> {
         let len = seq.len();
         (Just(seq), 1u16..=(len.min(u16::MAX as usize) as u16))
     })
+}
+
+/// Brute-force reference for canonical (w, k)-minimizers: the window minimum
+/// (leftmost on ties) over each gap-free run of valid k-mers, deduplicated by
+/// position, with the dedup state reset at each run boundary.
+fn brute_minimizers(seq: &[u8], k: u16, w: usize) -> Vec<(usize, u64)> {
+    let kmers: Vec<(usize, u64)> = NtHashBuilder::new(seq)
+        .k(k)
+        .num_hashes(1)
+        .pos(0)
+        .finish()
+        .unwrap()
+        .map(|(p, h)| (p, h[0]))
+        .collect();
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < kmers.len() {
+        let mut j = i;
+        while j + 1 < kmers.len() && kmers[j + 1].0 == kmers[j].0 + 1 {
+            j += 1;
+        }
+        let run = &kmers[i..=j];
+        let mut last: Option<usize> = None;
+        for start in 0..=run.len().saturating_sub(w) {
+            if run.len() < w {
+                break;
+            }
+            let m = run[start..start + w]
+                .iter()
+                .copied()
+                .min_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)))
+                .unwrap();
+            if last != Some(m.0) {
+                last = Some(m.0);
+                out.push(m);
+            }
+        }
+        i = j + 1;
+    }
+    out
 }
 
 proptest! {
@@ -134,6 +176,37 @@ proptest! {
         }
     }
 
+    /// Minimizers match an independent brute-force window-minimum reference,
+    /// for sequences that may contain `N` (exercising the gap reset).
+    #[test]
+    fn minimizers_match_brute_force(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..256),
+        k in 1u16..24,
+        w in 1usize..8,
+    ) {
+        prop_assume!((k as usize) <= seq.len());
+        let got: Vec<(usize, u64)> = MinimizerBuilder::new(&seq)
+            .k(k)
+            .w(w)
+            .finish()
+            .unwrap()
+            .map(|m| (m.pos, m.hash))
+            .collect();
+        prop_assert_eq!(got, brute_minimizers(&seq, k, w));
+    }
+
+    /// The set of selected minimizer hashes is invariant under reverse
+    /// complement — canonical minimizers.
+    #[test]
+    fn minimizer_hashes_invariant_under_revcomp((seq, k) in seq_and_k(), w in 1usize..8) {
+        let fwd: HashSet<u64> = MinimizerBuilder::new(&seq)
+            .k(k).w(w).finish().unwrap().map(|m| m.hash).collect();
+        let rc = revcomp(&seq);
+        let rev: HashSet<u64> = MinimizerBuilder::new(&rc)
+            .k(k).w(w).finish().unwrap().map(|m| m.hash).collect();
+        prop_assert_eq!(fwd, rev);
+    }
+
     /// Robustness: arbitrary bytes / k / pos / num_hashes must never panic —
     /// construction either errors cleanly or yields a hasher that rolls to
     /// completion. This is a proptest stand-in for fuzzing that runs in normal
@@ -144,6 +217,7 @@ proptest! {
         k in 0u16..300,
         num_hashes in 0u8..6,
         pos in 0usize..400,
+        w in 0usize..12,
     ) {
         if let Ok(mut h) = NtHash::new(&seq, k, num_hashes, pos) {
             while h.roll() { std::hint::black_box(h.hashes()); }
@@ -155,6 +229,9 @@ proptest! {
                 h.roll(c);
                 std::hint::black_box(h.hashes());
             }
+        }
+        if let Ok(mins) = MinimizerBuilder::new(&seq).k(k).w(w).finish() {
+            for m in mins { std::hint::black_box(m); }
         }
     }
 

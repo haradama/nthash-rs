@@ -38,39 +38,47 @@ fn parse_seed_string(mask: &str, k: usize) -> Result<Vec<usize>> {
         .collect())
 }
 
-/// Computes the forward and reverse hash values for a given k-mer using a spaced seed.
+/// A single spaced seed with its per-care-position rotation tables precomputed.
 ///
-/// # Arguments
-/// - `window`: The current k-mer slice from the sequence.
-/// - `care`: The positions to include in hashing (as defined by the spaced seed).
-/// - `k`: Length of the k-mer.
-///
-/// # Returns
-/// A tuple of (forward_hash, reverse_hash).
-#[inline]
-fn compute_pair(window: &[u8], care: &[usize], k: usize) -> (u64, u64) {
-    let mut fwd = 0u64;
-    let mut rev = 0u64;
-    for &p in care {
-        let c_f = window[p];
-        let c_r = c_f & CP_OFF; // Apply complement transformation
+/// For a fixed seed and `k`, the split-rotate distance at each care position is
+/// constant (`k-1-p` forward, `p` reverse); only the base at that position
+/// varies. We therefore precompute `srol_table` for every byte value once, so
+/// the per-window inner loop is a single array load instead of two `srol_table`
+/// calls (each a `% 31` / `% 33` reduction plus a `MS_TAB_*` pointer-chase).
+/// `rot` is a flattened `care.len() × 256` table indexed as
+/// `[care_idx * 256 + byte]`; each entry packs the forward rotation in `[0]` and
+/// the reverse rotation in `[1]`, so both are fetched from one cache line.
+struct SeedTab {
+    care: Vec<usize>,
+    rot: Vec<[u64; 2]>,
+}
 
-        fwd ^= srol_table(c_f, (k - 1 - p) as u32); // Position-dependent rotation
-        rev ^= srol_table(c_r, p as u32);
+/// Precompute the rotation tables for one seed's care positions.
+fn build_seed_tab(care: Vec<usize>, k: usize) -> SeedTab {
+    let mut rot = vec![[0u64; 2]; care.len() * 256];
+    for (i, &p) in care.iter().enumerate() {
+        let d_fwd = (k - 1 - p) as u32;
+        let d_rev = p as u32;
+        for c in 0u32..256 {
+            rot[i * 256 + c as usize] = [
+                srol_table(c as u8, d_fwd),
+                srol_table((c as u8) & CP_OFF, d_rev),
+            ];
+        }
     }
-    (fwd, rev)
+    SeedTab { care, rot }
 }
 
 /// Struct for computing spaced-seed ntHash values in a re-computational manner.
 /// Can handle multiple seeds and generates multiple hashes per k-mer.
 pub struct SeedNtHash<'a> {
-    seq: &'a [u8],          // Input nucleotide sequence
-    k: usize,               // k-mer size
-    num_hashes: usize,      // Number of hashes per seed
-    seeds: Vec<Vec<usize>>, // Care indices for each seed
-    pos: usize,             // Current position in the sequence
-    hashes: Vec<u64>,       // Hash results (flattened)
-    initialised: bool,      // Whether the hasher has found the first valid k-mer
+    seq: &'a [u8],       // Input nucleotide sequence
+    k: usize,            // k-mer size
+    num_hashes: usize,   // Number of hashes per seed
+    seeds: Vec<SeedTab>, // Care indices + precomputed rotation tables per seed
+    pos: usize,          // Current position in the sequence
+    hashes: Vec<u64>,    // Hash results (flattened)
+    initialised: bool,   // Whether the hasher has found the first valid k-mer
 }
 
 impl<'a> SeedNtHash<'a> {
@@ -104,7 +112,8 @@ impl<'a> SeedNtHash<'a> {
 
         let mut seeds = Vec::with_capacity(seed_masks.len());
         for m in seed_masks {
-            seeds.push(parse_seed_string(m, k_usz)?);
+            let care = parse_seed_string(m, k_usz)?;
+            seeds.push(build_seed_tab(care, k_usz));
         }
 
         Ok(Self {
@@ -138,7 +147,12 @@ impl<'a> SeedNtHash<'a> {
             start_pos,
         )
         .map(|mut s| {
-            s.seeds = seeds;
+            // Replace the dummy (empty-care) seeds with the caller's care indices,
+            // rebuilding the precomputed rotation tables for each.
+            s.seeds = seeds
+                .into_iter()
+                .map(|care| build_seed_tab(care, k_usz))
+                .collect();
             s
         })
     }
@@ -180,14 +194,20 @@ impl<'a> SeedNtHash<'a> {
     /// Returns false if any ambiguous base is found.
     fn compute_current(&mut self) -> bool {
         let win = &self.seq[self.pos..self.pos + self.k];
-        for care in &self.seeds {
-            if care.iter().any(|&p| SEED_TAB[win[p] as usize] == SEED_N) {
+        for st in &self.seeds {
+            if st.care.iter().any(|&p| SEED_TAB[win[p] as usize] == SEED_N) {
                 return false;
             }
         }
 
-        for (i_seed, care) in self.seeds.iter().enumerate() {
-            let (fwd, rev) = compute_pair(win, care, self.k);
+        for (i_seed, st) in self.seeds.iter().enumerate() {
+            let mut fwd = 0u64;
+            let mut rev = 0u64;
+            for (i, &p) in st.care.iter().enumerate() {
+                let e = st.rot[i * 256 + win[p] as usize];
+                fwd ^= e[0];
+                rev ^= e[1];
+            }
             let slice = &mut self.hashes[i_seed * self.num_hashes..(i_seed + 1) * self.num_hashes];
             extend_hashes(fwd, rev, self.k as u32, slice);
         }
