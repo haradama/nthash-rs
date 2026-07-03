@@ -83,4 +83,15 @@ fuzz_target!(|input: Input| {
             }
         }
     }
+
+    // Batch read hasher over equal-length slices of the input.
+    if let Ok(hasher) = nthash_rs::ReadHasher::new(k) {
+        let reads = [seq.as_slice(); LANES_PLUS_ONE];
+        let _ = hasher.hash_reads(&reads, |_ri, _pos, hash| {
+            std::hint::black_box(hash);
+        });
+    }
 });
+
+/// One full AVX2 lane group (4) plus a scalar-tail read.
+const LANES_PLUS_ONE: usize = 5;

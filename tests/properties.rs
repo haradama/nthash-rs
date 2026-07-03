@@ -24,10 +24,11 @@
 use nthash_rs::{
     canonical,
     kmer::{base_forward_hash, base_reverse_hash},
-    BlindNtHash, MinimizerBuilder, NtHash, NtHashBuilder, SeedNtHash,
+    BlindNtHash, BlindNtHashBuilder, MinimizerBuilder, NtHash, NtHashBuilder, ReadHasher,
+    SeedNtHash,
 };
 use proptest::prelude::*;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// Reverse complement of an A/C/G/T sequence.
 fn revcomp(s: &[u8]) -> Vec<u8> {
@@ -207,6 +208,34 @@ proptest! {
         prop_assert_eq!(fwd, rev);
     }
 
+    /// The batch read hasher (AVX2 where available) is bit-identical to
+    /// per-read `BlindNtHash`, across full lane groups and the scalar tail.
+    #[test]
+    fn batch_matches_blind(
+        (len, nreads) in (1usize..40, 1usize..10),
+        k in 1u16..32,
+    ) {
+        prop_assume!((k as usize) <= len);
+        // Deterministic ACGT reads derived from indices (no extra strategy noise).
+        let reads_owned: Vec<Vec<u8>> = (0..nreads)
+            .map(|r| (0..len).map(|i| b"ACGT"[(i * 7 + r * 3) % 4]).collect())
+            .collect();
+        let reads: Vec<&[u8]> = reads_owned.iter().map(|v| v.as_slice()).collect();
+
+        let mut got = BTreeMap::new();
+        ReadHasher::new(k)
+            .unwrap()
+            .hash_reads(&reads, |ri, pos, h| { got.insert((ri, pos), h); })
+            .unwrap();
+
+        let mut exp = BTreeMap::new();
+        for (ri, r) in reads.iter().enumerate() {
+            BlindNtHashBuilder::new(r).k(k).num_hashes(1).finish().unwrap()
+                .for_each_hash(|pos, h| { exp.insert((ri, pos), h[0]); });
+        }
+        prop_assert_eq!(got, exp);
+    }
+
     /// Robustness: arbitrary bytes / k / pos / num_hashes must never panic —
     /// construction either errors cleanly or yields a hasher that rolls to
     /// completion. This is a proptest stand-in for fuzzing that runs in normal
@@ -232,6 +261,12 @@ proptest! {
         }
         if let Ok(mins) = MinimizerBuilder::new(&seq).k(k).w(w).finish() {
             for m in mins { std::hint::black_box(m); }
+        }
+        // Batch path over 5 equal-length reads (one AVX2 group + scalar tail).
+        // Arbitrary bytes are out of contract but must not panic.
+        if let Ok(h) = ReadHasher::new(k) {
+            let reads = vec![seq.as_slice(); 5];
+            let _ = h.hash_reads(&reads, |_, _, hash| { std::hint::black_box(hash); });
         }
     }
 

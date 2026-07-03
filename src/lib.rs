@@ -43,6 +43,8 @@
 mod constants;
 mod tables;
 
+/// Batch canonical hashing of many equal-length reads, with an AVX2 backend.
+pub mod batch;
 pub mod blind;
 /// High‑level contiguous k‑mer rolling hasher.
 /// Skips over non‑ACGT bases exactly as the original reference.
@@ -84,6 +86,8 @@ pub use minimizer::Minimizer;
 pub use minimizer::MinimizerBuilder;
 pub use minimizer::Minimizers;
 
+pub use batch::ReadHasher;
+
 // --------------------------------------------------------------------------
 // Crate‑wide result and error types
 // --------------------------------------------------------------------------
@@ -101,6 +105,10 @@ pub enum NtHashError {
     /// Minimizer window `w` was zero.
     #[error("w must be > 0")]
     InvalidW,
+
+    /// Batch read hashing requires every read to have the same length.
+    #[error("reads must all have the same length ({expected}), found {found}")]
+    UnequalReadLengths { expected: usize, found: usize },
 
     /// Provided sequence length is shorter than `k`.
     #[error("sequence length ({seq_len}) < k ({k})")]
