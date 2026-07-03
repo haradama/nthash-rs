@@ -10,10 +10,11 @@
 //! Because DNA has only four bases, the per-step table lookups
 //! (`SEED_TAB[..]`, `srol_table(.., k)`) are resolved by **selecting among four
 //! precomputed constants** rather than by a gather — cheap and fully
-//! vectorisable. On `x86_64` with AVX2 (detected at run time) four reads are
-//! hashed per step; everywhere else, and for the ragged tail of reads that
-//! don't fill a lane group, a scalar path is used. Both paths are validated to
-//! produce **bit-identical** results.
+//! vectorisable. Reads are hashed in parallel via SIMD, detected at run time:
+//! **AVX2** on `x86_64` (all four lanes in one 256-bit vector) and **NEON** on
+//! `aarch64` (the four reads as two 128-bit lane-pairs). Everywhere else, and
+//! for the ragged tail of reads that don't fill a lane group, a scalar path is
+//! used. All paths are validated to produce **bit-identical** results.
 //!
 //! Like [`BlindNtHash`](crate::blind), this fast path assumes **N-free A/C/G/T**
 //! input: it does not skip ambiguous bases. Use [`NtHash`](crate::kmer) when the
@@ -142,6 +143,15 @@ impl ReadHasher {
                 return;
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                // SAFETY: guarded by run-time NEON detection (always true on the
+                // aarch64 baseline, checked for form).
+                unsafe { self.hash_group_neon(base, group, f) };
+                return;
+            }
+        }
         for (lane, read) in group.iter().enumerate() {
             self.hash_one(base + lane, read, f);
         }
@@ -261,6 +271,133 @@ impl ReadHasher {
             // canonical = fwd + rev (wrapping), per lane.
             let canon = _mm256_add_epi64(fwd, rev);
             _mm256_storeu_si256(fwd_arr.as_mut_ptr() as *mut __m256i, canon);
+            let pos = i - k + 1;
+            f(base, pos, fwd_arr[0]);
+            f(base + 1, pos, fwd_arr[1]);
+            f(base + 2, pos, fwd_arr[2]);
+            f(base + 3, pos, fwd_arr[3]);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn hash_group_neon<F: FnMut(usize, usize, u64)>(
+        &self,
+        base: usize,
+        group: &[&[u8]; LANES],
+        f: &mut F,
+    ) {
+        use core::arch::aarch64::*;
+
+        let k = self.k as usize;
+        let len = group[0].len();
+        let c = &self.consts;
+
+        // Splat each 4-constant table across both lanes of a uint64x2_t. NEON is
+        // 128-bit (2×u64), so the 4-read group is processed as two lane-pairs.
+        let splat = |t: &[u64; 4]| {
+            [
+                vdupq_n_u64(t[0]),
+                vdupq_n_u64(t[1]),
+                vdupq_n_u64(t[2]),
+                vdupq_n_u64(t[3]),
+            ]
+        };
+        let seed = splat(&c.seed);
+        let srolk = splat(&c.srolk);
+        let srolk_rc = splat(&c.srolk_rc);
+        let seed_rc = splat(&c.seed_rc);
+
+        // Select `t[code_lane]` per lane via two bit-selects (2-bit code).
+        #[inline(always)]
+        unsafe fn select4(t: &[uint64x2_t; 4], code: uint64x2_t) -> uint64x2_t {
+            let one = vdupq_n_u64(1);
+            let m0 = vceqq_u64(vandq_u64(code, one), one);
+            let lo = vbslq_u64(m0, t[1], t[0]);
+            let hi = vbslq_u64(m0, t[3], t[2]);
+            let m1 = vceqq_u64(vandq_u64(vshrq_n_u64::<1>(code), one), one);
+            vbslq_u64(m1, hi, lo)
+        }
+
+        #[inline(always)]
+        unsafe fn srol_neon(x: uint64x2_t) -> uint64x2_t {
+            let shifted = vandq_u64(vshlq_n_u64::<1>(x), vdupq_n_u64(0xFFFF_FFFD_FFFF_FFFF));
+            let hi = vshrq_n_u64::<30>(vandq_u64(x, vdupq_n_u64(0x8000_0000_0000_0000)));
+            let lo = vshrq_n_u64::<32>(vandq_u64(x, vdupq_n_u64(0x0000_0001_0000_0000)));
+            vorrq_u64(shifted, vorrq_u64(hi, lo))
+        }
+
+        #[inline(always)]
+        unsafe fn sror_neon(x: uint64x2_t) -> uint64x2_t {
+            let shifted = vandq_u64(vshrq_n_u64::<1>(x), vdupq_n_u64(0xFFFF_FFFE_FFFF_FFFF));
+            let hi = vshlq_n_u64::<30>(vandq_u64(x, vdupq_n_u64(0x0000_0002_0000_0000)));
+            let lo = vshlq_n_u64::<32>(vandq_u64(x, vdupq_n_u64(0x0000_0000_0000_0001)));
+            vorrq_u64(shifted, vorrq_u64(hi, lo))
+        }
+
+        // Roll one 2-lane vector pair forward by one base.
+        #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn roll_pair(
+            fwd: uint64x2_t,
+            rev: uint64x2_t,
+            in_code: uint64x2_t,
+            out_code: uint64x2_t,
+            seed: &[uint64x2_t; 4],
+            srolk: &[uint64x2_t; 4],
+            srolk_rc: &[uint64x2_t; 4],
+            seed_rc: &[uint64x2_t; 4],
+        ) -> (uint64x2_t, uint64x2_t) {
+            let fwd = veorq_u64(
+                veorq_u64(srol_neon(fwd), select4(seed, in_code)),
+                select4(srolk, out_code),
+            );
+            let inner = veorq_u64(
+                veorq_u64(rev, select4(srolk_rc, in_code)),
+                select4(seed_rc, out_code),
+            );
+            (fwd, sror_neon(inner))
+        }
+
+        // Per-lane 2-bit codes for two adjacent reads at column `i`.
+        #[inline(always)]
+        unsafe fn codes_pair(group: &[&[u8]; LANES], lane0: usize, i: usize) -> uint64x2_t {
+            let arr = [
+                base_code(group[lane0][i]) as u64,
+                base_code(group[lane0 + 1][i]) as u64,
+            ];
+            vld1q_u64(arr.as_ptr())
+        }
+
+        // Seed each lane with the first k-mer's forward/reverse hash.
+        let mut fwd_arr = [0u64; LANES];
+        let mut rev_arr = [0u64; LANES];
+        for lane in 0..LANES {
+            fwd_arr[lane] = base_forward_hash(group[lane], self.k);
+            rev_arr[lane] = base_reverse_hash(group[lane], self.k);
+            f(base + lane, 0, canonical(fwd_arr[lane], rev_arr[lane]));
+        }
+        let mut fwd0 = vld1q_u64(fwd_arr.as_ptr());
+        let mut fwd1 = vld1q_u64(fwd_arr.as_ptr().add(2));
+        let mut rev0 = vld1q_u64(rev_arr.as_ptr());
+        let mut rev1 = vld1q_u64(rev_arr.as_ptr().add(2));
+
+        for i in k..len {
+            let out0 = codes_pair(group, 0, i - k);
+            let in0 = codes_pair(group, 0, i);
+            let out1 = codes_pair(group, 2, i - k);
+            let in1 = codes_pair(group, 2, i);
+
+            let (nf0, nr0) = roll_pair(fwd0, rev0, in0, out0, &seed, &srolk, &srolk_rc, &seed_rc);
+            let (nf1, nr1) = roll_pair(fwd1, rev1, in1, out1, &seed, &srolk, &srolk_rc, &seed_rc);
+            fwd0 = nf0;
+            rev0 = nr0;
+            fwd1 = nf1;
+            rev1 = nr1;
+
+            // canonical = fwd + rev (wrapping), per lane.
+            vst1q_u64(fwd_arr.as_mut_ptr(), vaddq_u64(fwd0, rev0));
+            vst1q_u64(fwd_arr.as_mut_ptr().add(2), vaddq_u64(fwd1, rev1));
             let pos = i - k + 1;
             f(base, pos, fwd_arr[0]);
             f(base + 1, pos, fwd_arr[1]);

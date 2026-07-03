@@ -1,0 +1,9 @@
+# Local CI via act (https://github.com/nektos/act).
+#
+#   act -j test         # lint + build + unit/property/regression/doc tests
+#   act -j fuzz-build   # nightly cargo-fuzz target build
+#
+# Pin a full-featured runner image and the linux/amd64 platform so the run
+# matches GitHub's ubuntu-latest.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+--container-architecture linux/amd64
