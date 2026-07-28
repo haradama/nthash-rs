@@ -93,8 +93,65 @@ fn brute_minimizers(seq: &[u8], k: u16, w: usize) -> Vec<(usize, u64)> {
     out
 }
 
+/// Brute-force spaced-seed reference: recompute each window independently from
+/// the ntHash definition, using only the crate's public `srol_table`. The test
+/// input is A/C/G/T/N, so "valid base" is exactly A/C/G/T.
+fn brute_seed(seq: &[u8], care: &[usize], k: usize, num_hashes: usize) -> Vec<(usize, Vec<u64>)> {
+    use nthash_rs::{extend_hashes, srol_table};
+    const CP: u8 = 0x07;
+    let mut out = Vec::new();
+    if seq.len() < k {
+        return out;
+    }
+    for pos in 0..=seq.len() - k {
+        let win = &seq[pos..pos + k];
+        if care
+            .iter()
+            .any(|&p| !matches!(win[p], b'A' | b'C' | b'G' | b'T'))
+        {
+            continue;
+        }
+        let (mut fwd, mut rev) = (0u64, 0u64);
+        for &p in care {
+            fwd ^= srol_table(win[p], (k - 1 - p) as u32);
+            rev ^= srol_table(win[p] & CP, p as u32);
+        }
+        let mut h = vec![0u64; num_hashes];
+        extend_hashes(fwd, rev, k as u32, &mut h);
+        out.push((pos, h));
+    }
+    out
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(400))]
+
+    /// The rolling `SeedNtHash` is bit-identical to a from-scratch recompute of
+    /// every window, for arbitrary spaced-seed masks and N-containing input.
+    #[test]
+    fn seed_rolling_matches_recompute(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..200),
+        mask_bits in prop::collection::vec(prop::sample::select(&b"01"[..]), 1..24),
+        m in 1usize..3,
+    ) {
+        let k = mask_bits.len();
+        prop_assume!(k <= seq.len());
+        let mask: String = mask_bits.iter().map(|&b| b as char).collect();
+        let care: Vec<usize> = mask
+            .bytes()
+            .enumerate()
+            .filter_map(|(i, b)| if b == b'1' { Some(i) } else { None })
+            .collect();
+
+        let got: Vec<(usize, Vec<u64>)> = nthash_rs::SeedNtHashBuilder::new(&seq)
+            .k(k as u16)
+            .masks(vec![mask])
+            .num_hashes(m)
+            .finish()
+            .unwrap()
+            .collect();
+        prop_assert_eq!(got, brute_seed(&seq, &care, k, m));
+    }
 
     /// (1) The rolling forward/reverse hash of each window equals the hash of
     /// that window computed in isolation — the hash is a pure function of the
@@ -125,6 +182,42 @@ proptest! {
             prop_assert_eq!(h.forward_hash(), base_forward_hash(w, k));
             prop_assert_eq!(h.reverse_hash(), base_reverse_hash(w, k));
         }
+    }
+
+    /// The canonical-only fast path yields exactly the canonical hash of the
+    /// general path (`hashes[0]`), at every valid k-mer, including across
+    /// `N`-skips.
+    #[test]
+    fn for_each_canonical_matches_general(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..256),
+        k in 1u16..24,
+    ) {
+        prop_assume!((k as usize) <= seq.len());
+        let mut general = Vec::new();
+        NtHashBuilder::new(&seq).k(k).num_hashes(1).finish().unwrap()
+            .for_each_hash(|pos, h| general.push((pos, h[0])));
+        let mut fast = Vec::new();
+        NtHashBuilder::new(&seq).k(k).num_hashes(1).finish().unwrap()
+            .for_each_canonical(|pos, h| fast.push((pos, h)));
+        prop_assert_eq!(fast, general);
+    }
+
+    /// `BlindNtHash`'s canonical fast path (which reads the outgoing base from
+    /// `seq` and skips the window buffer) matches its general path exactly —
+    /// including the `N`-as-zero-contribution behaviour on ambiguous bases.
+    #[test]
+    fn blind_for_each_canonical_matches_general(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..256),
+        k in 1u16..24,
+    ) {
+        prop_assume!((k as usize) <= seq.len());
+        let mut general = Vec::new();
+        BlindNtHashBuilder::new(&seq).k(k).num_hashes(1).finish().unwrap()
+            .for_each_hash(|pos, h| general.push((pos, h[0])));
+        let mut fast = Vec::new();
+        BlindNtHashBuilder::new(&seq).k(k).num_hashes(1).finish().unwrap()
+            .for_each_canonical(|pos, h| fast.push((pos, h)));
+        prop_assert_eq!(fast, general);
     }
 
     /// (2) The canonical hash is invariant under reverse complement, and (3)
