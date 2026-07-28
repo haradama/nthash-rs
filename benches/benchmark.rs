@@ -7,6 +7,7 @@ use fnv::FnvHasher;
 use fxhash::FxHasher64;
 use xxhash_rust::xxh3::xxh3_64;
 
+use nthash::NtHashIterator;
 use nthash_rs::SeedNtHashBuilder;
 use nthash_rs::{kmer::NtHashBuilder, BlindNtHashBuilder};
 
@@ -35,19 +36,45 @@ fn bench_nthash(c: &mut Criterion) {
 
     group.bench_with_input(BenchmarkId::new("NtHash", seq.len()), &seq, |b, seq| {
         b.iter(|| {
-            // build a new rolling iterator each iteration and consume it via the
-            // zero-allocation path (no Vec<u64> per k-mer)
+            // One canonical hash per k-mer via the allocation-free, buffer-free
+            // fast path — the direct analogue of luizirber's canonical iterator.
             NtHashBuilder::new(seq.as_bytes())
                 .k(k)
                 .num_hashes(m)
                 .pos(0)
                 .finish()
                 .unwrap()
-                .for_each_hash(|_pos, hashes| {
-                    black_box(hashes);
+                .for_each_canonical(|_pos, hash| {
+                    black_box(hash);
                 });
         })
     });
+
+    group.finish();
+}
+
+/// Comparison against the `nthash` crate (luizirber/nthash): its canonical
+/// rolling iterator over the same single sequence, one hash per k-mer — the
+/// direct analogue of our `NtHash` with `num_hashes = 1`.
+fn bench_nthash_luizirber(c: &mut Criterion) {
+    let seq = generate_dna(1_000_000);
+    let k: usize = 31;
+
+    let mut group = c.benchmark_group("nthash_vs_others");
+    group.throughput(Throughput::Bytes(seq.len() as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("nthash(luizirber)", seq.len()),
+        &seq,
+        |b, seq| {
+            b.iter(|| {
+                let iter = NtHashIterator::new(seq.as_bytes(), k).unwrap();
+                for h in iter {
+                    black_box(h);
+                }
+            })
+        },
+    );
 
     group.finish();
 }
@@ -71,8 +98,8 @@ fn bench_blindnthash(c: &mut Criterion) {
                     .pos(0)
                     .finish()
                     .unwrap()
-                    .for_each_hash(|_pos, hashes| {
-                        black_box(hashes);
+                    .for_each_canonical(|_pos, hash| {
+                        black_box(hash);
                     });
             })
         },
@@ -198,6 +225,7 @@ fn bench_fxhash(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_nthash,
+    bench_nthash_luizirber,
     bench_blindnthash,
     bench_seednthash,
     bench_xxh3,

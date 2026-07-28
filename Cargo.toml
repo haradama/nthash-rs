@@ -21,6 +21,7 @@ ahash = "0.8.12"
 criterion = "0.5.1"
 fnv = "1.0.7"
 fxhash = "0.2.1"
+nthash = "0.5.1"
 proptest = "1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
