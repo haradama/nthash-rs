@@ -14,7 +14,7 @@
 
 use crate::{
     constants::{CP_OFF, SEED_N, SEED_TAB},
-    tables::srol_table,
+    tables::{srol, srol_table, sror},
     util::extend_hashes,
     NtHashError, Result,
 };
@@ -38,22 +38,49 @@ fn parse_seed_string(mask: &str, k: usize) -> Result<Vec<usize>> {
         .collect())
 }
 
-/// A single spaced seed with its per-care-position rotation tables precomputed.
+/// A base-indexed `[fwd, rev]` contribution table for one care position, used at
+/// a run boundary during rolling. Indexed by the raw base byte (256 entries).
+struct BoundaryTab {
+    off: usize,
+    tab: Vec<[u64; 2]>,
+}
+
+/// A single spaced seed: the care positions plus everything needed to both
+/// recompute a window from scratch and *roll* between windows.
 ///
-/// For a fixed seed and `k`, the split-rotate distance at each care position is
-/// constant (`k-1-p` forward, `p` reverse); only the base at that position
-/// varies. We therefore precompute `srol_table` for every byte value once, so
-/// the per-window inner loop is a single array load instead of two `srol_table`
-/// calls (each a `% 31` / `% 33` reduction plus a `MS_TAB_*` pointer-chase).
-/// `rot` is a flattened `care.len() × 256` table indexed as
-/// `[care_idx * 256 + byte]`; each entry packs the forward rotation in `[0]` and
-/// the reverse rotation in `[1]`, so both are fetched from one cache line.
+/// - `rot` — flattened `care.len() × 256` table `[fwd, rev]` for recomputing a
+///   window (used at init and after every roll would be too slow — it is the
+///   O(care) path).
+/// - `left` / `right` — the **run boundaries** of the care pattern: the only
+///   positions whose care-membership changes when the window slides by one.
+///   Rolling is `srol(fwd)` / `sror(rev)` plus a correction at each boundary, so
+///   the per-window cost is O(#runs) instead of O(#care).
 struct SeedTab {
     care: Vec<usize>,
     rot: Vec<[u64; 2]>,
+    left: Vec<BoundaryTab>,
+    right: Vec<BoundaryTab>,
+    /// Whether rolling (O(#boundaries)) is cheaper than recompute (O(#care)) for
+    /// this seed. Scattered seeds (many short runs) can have more boundaries than
+    /// care positions, where recompute wins — so we pick per seed and never
+    /// regress relative to plain recompute.
+    rollable: bool,
 }
 
-/// Precompute the rotation tables for one seed's care positions.
+/// Build a 256-entry `[srol_table(base, d_fwd), srol_table(base & CP, d_rev)]`
+/// contribution table for one boundary position.
+fn boundary_tab(off: usize, d_fwd: u32, d_rev: u32) -> BoundaryTab {
+    let mut tab = vec![[0u64; 2]; 256];
+    for c in 0u32..256 {
+        tab[c as usize] = [
+            srol_table(c as u8, d_fwd),
+            srol_table((c as u8) & CP_OFF, d_rev),
+        ];
+    }
+    BoundaryTab { off, tab }
+}
+
+/// Precompute the recompute and roll tables for one seed's care positions.
 fn build_seed_tab(care: Vec<usize>, k: usize) -> SeedTab {
     let mut rot = vec![[0u64; 2]; care.len() * 256];
     for (i, &p) in care.iter().enumerate() {
@@ -66,19 +93,60 @@ fn build_seed_tab(care: Vec<usize>, k: usize) -> SeedTab {
             ];
         }
     }
-    SeedTab { care, rot }
+
+    // Run boundaries: a forward slide turns `srol(fwd)`/`sror(rev)` of the old
+    // hash into the new hash, except at care positions whose neighbour on one
+    // side is *not* a care position — there the contribution must be corrected.
+    // `srol_table` has period lcm(31, 33) = 1023 in its rotation argument, so a
+    // rotation of `p - 1` at `p == 0` is taken mod 1023 (→ 1022).
+    let mut in_care = vec![false; k];
+    for &p in &care {
+        in_care[p] = true;
+    }
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for &p in &care {
+        if p == 0 || !in_care[p - 1] {
+            // Base leaving the care coverage on a forward slide.
+            let d_rev = (p as i64 - 1).rem_euclid(1023) as u32;
+            left.push(boundary_tab(p, (k - p) as u32, d_rev));
+        }
+        if p + 1 == k || !in_care[p + 1] {
+            // Base entering the care coverage on a forward slide.
+            right.push(boundary_tab(p, (k - 1 - p) as u32, p as u32));
+        }
+    }
+
+    let rollable = left.len() + right.len() < care.len();
+    SeedTab {
+        care,
+        rot,
+        left,
+        right,
+        rollable,
+    }
 }
 
-/// Struct for computing spaced-seed ntHash values in a re-computational manner.
-/// Can handle multiple seeds and generates multiple hashes per k-mer.
+/// Rolling state for one seed: its forward/reverse hashes for the current
+/// window and how many of its care positions currently hold an ambiguous base.
+#[derive(Clone, Copy)]
+struct SeedState {
+    fwd: u64,
+    rev: u64,
+    n_invalid: usize,
+}
+
+/// Rolling spaced-seed ntHash. Handles multiple seeds and multiple hashes per
+/// k-mer, advancing between windows in O(#care-runs) rather than recomputing.
 pub struct SeedNtHash<'a> {
-    seq: &'a [u8],       // Input nucleotide sequence
-    k: usize,            // k-mer size
-    num_hashes: usize,   // Number of hashes per seed
-    seeds: Vec<SeedTab>, // Care indices + precomputed rotation tables per seed
-    pos: usize,          // Current position in the sequence
-    hashes: Vec<u64>,    // Hash results (flattened)
-    initialised: bool,   // Whether the hasher has found the first valid k-mer
+    seq: &'a [u8],          // Input nucleotide sequence
+    k: usize,               // k-mer size
+    num_hashes: usize,      // Number of hashes per seed
+    seeds: Vec<SeedTab>,    // Care indices + precomputed roll/recompute tables
+    state: Vec<SeedState>,  // Per-seed rolling hash state
+    pos: usize,             // Current position in the sequence
+    hashes: Vec<u64>,       // Hash results (flattened)
+    initialised: bool,      // Whether the hasher has found the first valid k-mer
 }
 
 impl<'a> SeedNtHash<'a> {
@@ -116,11 +184,20 @@ impl<'a> SeedNtHash<'a> {
             seeds.push(build_seed_tab(care, k_usz));
         }
 
+        let state = vec![
+            SeedState {
+                fwd: 0,
+                rev: 0,
+                n_invalid: 0,
+            };
+            seeds.len()
+        ];
         Ok(Self {
             seq,
             k: k_usz,
             num_hashes: num_hashes_per_seed.max(1),
             seeds,
+            state,
             pos: start_pos,
             hashes: vec![0; seed_masks.len() * num_hashes_per_seed.max(1)],
             initialised: false,
@@ -177,53 +254,118 @@ impl<'a> SeedNtHash<'a> {
     /// of the contiguous [`NtHash`](crate::kmer::NtHash). `false` is returned
     /// only when the end of the sequence is reached.
     pub fn roll(&mut self) -> bool {
+        let last = self.seq.len() - self.k;
         if !self.initialised {
-            return self.init();
+            self.initialised = true;
+            // Recompute the state for the starting window, then emit it if valid.
+            self.compute_state_at(self.pos);
+            if self.all_valid() {
+                self.emit();
+                return true;
+            }
+            // Otherwise fall through and roll forward to the first valid window.
         }
-
-        while self.pos < self.seq.len() - self.k {
-            self.pos += 1;
-            if self.compute_current() {
+        while self.pos < last {
+            self.roll_step();
+            if self.all_valid() {
+                self.emit();
                 return true;
             }
         }
         false // End of sequence
     }
 
-    /// Computes hashes for the k-mer at the current position.
-    /// Returns false if any ambiguous base is found.
-    fn compute_current(&mut self) -> bool {
-        let win = &self.seq[self.pos..self.pos + self.k];
-        for st in &self.seeds {
-            if st.care.iter().any(|&p| SEED_TAB[win[p] as usize] == SEED_N) {
-                return false;
-            }
-        }
-
-        for (i_seed, st) in self.seeds.iter().enumerate() {
-            let mut fwd = 0u64;
-            let mut rev = 0u64;
-            for (i, &p) in st.care.iter().enumerate() {
-                let e = st.rot[i * 256 + win[p] as usize];
-                fwd ^= e[0];
-                rev ^= e[1];
-            }
-            let slice = &mut self.hashes[i_seed * self.num_hashes..(i_seed + 1) * self.num_hashes];
-            extend_hashes(fwd, rev, self.k as u32, slice);
-        }
-        true
+    /// Whether every seed's current window is free of ambiguous care bases.
+    #[inline(always)]
+    fn all_valid(&self) -> bool {
+        self.state.iter().all(|s| s.n_invalid == 0)
     }
 
-    /// Initializes by finding the first valid k-mer in the sequence.
-    fn init(&mut self) -> bool {
-        while self.pos <= self.seq.len() - self.k {
-            if self.compute_current() {
-                self.initialised = true;
-                return true;
+    /// Recompute one seed's state from scratch for the window at `pos` — the
+    /// O(#care) path, used at init and for seeds where rolling doesn't pay.
+    fn recompute_seed(&mut self, si: usize, pos: usize) {
+        let st = &self.seeds[si];
+        let mut fwd = 0u64;
+        let mut rev = 0u64;
+        let mut n_invalid = 0usize;
+        for (i, &p) in st.care.iter().enumerate() {
+            let c = self.seq[pos + p] as usize;
+            let e = st.rot[i * 256 + c];
+            fwd ^= e[0];
+            rev ^= e[1];
+            if SEED_TAB[c] == SEED_N {
+                n_invalid += 1;
             }
-            self.pos += 1;
         }
-        false
+        self.state[si] = SeedState {
+            fwd,
+            rev,
+            n_invalid,
+        };
+    }
+
+    /// Roll one seed's state from the window at `pos` to `pos + 1`, correcting
+    /// only at the care pattern's run boundaries — the O(#boundaries) path.
+    fn roll_seed(&mut self, si: usize, pos: usize) {
+        let st = &self.seeds[si];
+        let s = &mut self.state[si];
+        let mut fwd = srol(s.fwd);
+        let mut rev = sror(s.rev);
+        let mut n_invalid = s.n_invalid;
+        // Bases leaving the care coverage.
+        for lb in &st.left {
+            let c = self.seq[pos + lb.off] as usize;
+            let e = lb.tab[c];
+            fwd ^= e[0];
+            rev ^= e[1];
+            if SEED_TAB[c] == SEED_N {
+                n_invalid -= 1;
+            }
+        }
+        // Bases entering the care coverage.
+        for rb in &st.right {
+            let c = self.seq[pos + 1 + rb.off] as usize;
+            let e = rb.tab[c];
+            fwd ^= e[0];
+            rev ^= e[1];
+            if SEED_TAB[c] == SEED_N {
+                n_invalid += 1;
+            }
+        }
+        *s = SeedState {
+            fwd,
+            rev,
+            n_invalid,
+        };
+    }
+
+    /// Recompute every seed's state from scratch for the window at `pos`.
+    fn compute_state_at(&mut self, pos: usize) {
+        for si in 0..self.seeds.len() {
+            self.recompute_seed(si, pos);
+        }
+    }
+
+    /// Advance every seed by one position, rolling or recomputing per seed.
+    fn roll_step(&mut self) {
+        let pos = self.pos;
+        for si in 0..self.seeds.len() {
+            if self.seeds[si].rollable {
+                self.roll_seed(si, pos);
+            } else {
+                self.recompute_seed(si, pos + 1);
+            }
+        }
+        self.pos = pos + 1;
+    }
+
+    /// Materialize the hash outputs for the current (valid) window.
+    fn emit(&mut self) {
+        for si in 0..self.seeds.len() {
+            let s = self.state[si];
+            let slice = &mut self.hashes[si * self.num_hashes..(si + 1) * self.num_hashes];
+            extend_hashes(s.fwd, s.rev, self.k as u32, slice);
+        }
     }
 }
 
