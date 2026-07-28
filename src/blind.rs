@@ -22,7 +22,7 @@ use crate::{
     constants::{CP_OFF, SEED_TAB},
     kmer::{base_forward_hash, base_reverse_hash},
     tables::{build_srol_k, srol, sror},
-    util::extend_hashes,
+    util::{canonical, extend_hashes},
     NtHashError, Result,
 };
 
@@ -262,6 +262,39 @@ impl<'a> BlindNtHashIter<'a> {
             let incoming = self.seq[cur + self.hasher.k as usize];
             self.hasher.roll(incoming);
             f(self.hasher.pos() as usize, self.hasher.hashes());
+        }
+    }
+
+    /// Drive the hasher to completion, invoking `f(pos, canonical_hash)` for each
+    /// window — the **fastest** streaming path.
+    ///
+    /// Because the iterator owns the sequence, it reads the outgoing base
+    /// straight from `seq` instead of the ring-buffer window, and computes the
+    /// canonical hash directly from the rolling state — bypassing both the
+    /// `VecDeque` window and the per-window `extend_hashes` + heap buffer that
+    /// [`for_each_hash`](Self::for_each_hash) pays. Yields exactly one hash per
+    /// window (the `num_hashes = 1` case).
+    #[inline]
+    pub fn for_each_canonical<F: FnMut(usize, u64)>(mut self, mut f: F) {
+        let seq = self.seq;
+        let end = self.end;
+        let k = self.hasher.k as usize;
+        if self.first {
+            self.first = false;
+            f(
+                self.hasher.pos as usize,
+                canonical(self.hasher.fwd_hash, self.hasher.rev_hash),
+            );
+        }
+        let h = &mut self.hasher;
+        while (h.pos as usize) < end {
+            let cur = h.pos as usize;
+            let char_out = seq[cur];
+            let char_in = seq[cur + k];
+            h.fwd_hash = next_forward_hash(&h.srol_k, h.fwd_hash, char_out, char_in);
+            h.rev_hash = next_reverse_hash(&h.srol_k, h.rev_hash, char_out, char_in);
+            h.pos += 1;
+            f(h.pos as usize, canonical(h.fwd_hash, h.rev_hash));
         }
     }
 }

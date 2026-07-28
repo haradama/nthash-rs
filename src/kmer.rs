@@ -15,7 +15,7 @@
 use crate::{
     constants::*,
     tables::{base_code, srol, srol_n, sror, RollConsts},
-    util::extend_hashes,
+    util::{canonical, extend_hashes},
     NtHashError, // unified crate-level error
 };
 
@@ -81,8 +81,24 @@ impl<'a> NtHash<'a> {
     /// Advance forward by one base, skipping over k‑mers with `N`.
     /// Returns `true` if a new valid hash was produced.
     pub fn roll(&mut self) -> bool {
+        if self.advance() {
+            self.update_hashes();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Advance by one base (with `N`-skip), updating the forward/reverse hashes
+    /// and position but **not** the materialized hash buffer.
+    ///
+    /// This is the state-only core of [`roll`](Self::roll) (which is `advance`
+    /// plus [`update_hashes`](Self::update_hashes)). The canonical-only fast
+    /// path uses it to skip the per-k-mer `extend_hashes` + heap buffer entirely.
+    #[inline]
+    pub(crate) fn advance(&mut self) -> bool {
         if !self.initialized {
-            return self.init();
+            return self.init_advance();
         }
         let k_usz = self.k as usize;
         if self.pos >= self.seq.len() - k_usz {
@@ -91,12 +107,11 @@ impl<'a> NtHash<'a> {
         let incoming = self.seq[self.pos + k_usz];
         if SEED_TAB[incoming as usize] == SEED_N {
             self.pos += k_usz;
-            return self.init();
+            return self.init_advance();
         }
         let outgoing = self.seq[self.pos];
         self.fwd_hash = next_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
         self.rev_hash = next_reverse_hash(&self.consts, self.rev_hash, outgoing, incoming);
-        self.update_hashes();
         self.pos += 1;
         true
     }
@@ -197,8 +212,19 @@ impl<'a> NtHash<'a> {
         self.rev_hash
     }
 
-    /// Initialize on the first valid k‑mer.
+    /// Initialize on the first valid k‑mer (materializing the hash buffer).
     fn init(&mut self) -> bool {
+        if self.init_advance() {
+            self.update_hashes();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Position on the first valid k‑mer, updating the forward/reverse hashes but
+    /// not the materialized buffer.
+    fn init_advance(&mut self) -> bool {
         let k_usz = self.k as usize;
         while self.pos <= self.seq.len() - k_usz {
             let mut skip = 0;
@@ -208,7 +234,6 @@ impl<'a> NtHash<'a> {
             }
             self.fwd_hash = base_forward_hash(&self.seq[self.pos..], self.k);
             self.rev_hash = base_reverse_hash(&self.seq[self.pos..], self.k);
-            self.update_hashes();
             self.initialized = true;
             return true;
         }
@@ -437,6 +462,58 @@ impl<'a> NtHashIter<'a> {
         }
         while self.hasher.roll() {
             f(self.hasher.pos(), self.hasher.hashes());
+        }
+    }
+
+    /// Drive the hasher to completion, invoking `f(pos, canonical_hash)` for each
+    /// valid k‑mer — the **fastest** way to obtain the single canonical hash per
+    /// k‑mer.
+    ///
+    /// Unlike [`for_each_hash`](Self::for_each_hash), this bypasses the per-k‑mer
+    /// `extend_hashes` mixing and the heap hash buffer entirely, computing the
+    /// canonical hash straight from the rolling forward/reverse state. It ignores
+    /// `num_hashes` (always yielding exactly the canonical hash), so use it when
+    /// one hash per k‑mer suffices — e.g. minimizers, sketching, membership.
+    #[inline]
+    pub fn for_each_canonical<F: FnMut(usize, u64)>(mut self, mut f: F) {
+        if self.done {
+            return;
+        }
+        let h = &mut self.hasher;
+        let seq = h.seq;
+        let k = h.k as usize;
+        let len = seq.len();
+        if len < k {
+            return;
+        }
+        let last = len - k; // last valid k-mer start index
+
+        // Prime once: position on the first valid k-mer. This hoists the
+        // `initialized` check out of the hot loop below (it recurs only on an
+        // actual N-skip), leaving a tight roll with each byte read exactly once.
+        if !h.advance() {
+            return;
+        }
+        loop {
+            f(h.pos, canonical(h.fwd_hash, h.rev_hash));
+            if h.pos >= last {
+                return;
+            }
+            let incoming = seq[h.pos + k];
+            if SEED_TAB[incoming as usize] == SEED_N {
+                // N-skip: jump past the ambiguous base and re-init, exactly as
+                // `roll` does; the loop top then emits the next run's first k-mer.
+                h.pos += k;
+                h.initialized = false;
+                if !h.advance() {
+                    return;
+                }
+                continue;
+            }
+            let outgoing = seq[h.pos];
+            h.fwd_hash = next_forward_hash(&h.consts, h.fwd_hash, outgoing, incoming);
+            h.rev_hash = next_reverse_hash(&h.consts, h.rev_hash, outgoing, incoming);
+            h.pos += 1;
         }
     }
 }

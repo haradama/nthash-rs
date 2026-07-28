@@ -188,12 +188,12 @@ impl Minimizers<'_> {
     #[inline(always)]
     fn step(&mut self) -> Option<Minimizer> {
         loop {
-            if !self.hasher.roll() {
+            // `advance` rolls the forward/reverse state with N-skip but skips the
+            // per-k-mer hash-buffer materialization we don't need here.
+            if !self.hasher.advance() {
                 return None;
             }
             let pos = self.hasher.pos();
-            // Compute the canonical hash from the strand hashes directly, rather
-            // than reading it back out of the hasher's heap `hashes` buffer.
             let hash = canonical(self.hasher.forward_hash(), self.hasher.reverse_hash());
 
             // An `N`-skip makes positions non-contiguous; reset the window so a
