@@ -7,14 +7,24 @@
 //! lockstep, one per SIMD lane. This is the natural shape of read processing in
 //! sequencing, where inputs are millions of short, fixed-length reads.
 //!
-//! Because DNA has only four bases, the per-step table lookups
-//! (`SEED_TAB[..]`, `srol_table(.., k)`) are resolved by **selecting among four
-//! precomputed constants** rather than by a gather — cheap and fully
-//! vectorisable. Reads are hashed in parallel via SIMD, detected at run time:
-//! **AVX2** on `x86_64` (all four lanes in one 256-bit vector) and **NEON** on
-//! `aarch64` (the four reads as two 128-bit lane-pairs). Everywhere else, and
-//! for the ragged tail of reads that don't fill a lane group, a scalar path is
-//! used. All paths are validated to produce **bit-identical** results.
+//! Because DNA has only four bases, one roll step is fully described by the
+//! `(outgoing, incoming)` pair — 16 possibilities — so the per-step table
+//! lookup is a 16-entry index into [`RollConsts::fwd_q`] / `rev_q` rather than
+//! a general gather. Backends, detected at run time:
+//!
+//! | backend | lanes | roll-table lookup |
+//! |---|---|---|
+//! | AVX-512F | 8 reads | `vpermi2q`, one instruction |
+//! | AVX2 | 8 reads (2×256-bit) | 128-byte L1 gather |
+//! | NEON (`aarch64`) | 4 reads (2×128-bit) | 2-bit blend tree |
+//! | scalar | 1 read | direct index |
+//!
+//! Each lane's next eight bases are fetched as one `u64` and consumed by
+//! shifting, so byte handling costs one load per lane per eight steps. All
+//! paths are validated to produce **bit-identical** results.
+//!
+//! The callback order is **unspecified** — vector backends emit a whole lane
+//! group per step, the scalar tail emits a whole read at a time.
 //!
 //! Like [`BlindNtHash`](crate::blind), this fast path assumes **N-free A/C/G/T**
 //! input: it does not skip ambiguous bases. Use [`NtHash`](crate::kmer) when the
@@ -33,12 +43,16 @@
 
 use crate::{
     kmer::{base_forward_hash, base_reverse_hash},
-    tables::{base_code, srol, sror, RollConsts},
+    tables::{roll_forward, roll_index, RollConsts},
     util::canonical,
     NtHashError, Result,
 };
 
-/// Number of reads processed per SIMD lane group (AVX2 = 4×u64).
+#[cfg(target_arch = "aarch64")]
+use crate::tables::base_code;
+
+/// Number of reads per NEON lane group (two 128-bit lane-pairs).
+#[cfg(target_arch = "aarch64")]
 const LANES: usize = 4;
 
 /// Batch hasher for many equal-length, N-free reads.
@@ -93,8 +107,281 @@ impl ReadHasher {
             }
         }
 
-        // Process full lane groups with the fastest available kernel, then the
-        // ragged tail scalar.
+        // Dispatch once for the whole batch, not per lane group.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx512f") {
+                // SAFETY: guarded by run-time AVX-512F detection.
+                unsafe { self.hash_reads_avx512(reads, &mut f) };
+                return Ok(());
+            }
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by run-time AVX2 detection.
+                unsafe { self.hash_reads_avx2(reads, &mut f) };
+                return Ok(());
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                // SAFETY: guarded by run-time NEON detection (always true on the
+                // aarch64 baseline, checked for form).
+                unsafe { self.hash_reads_neon(reads, &mut f) };
+                return Ok(());
+            }
+        }
+        #[allow(unreachable_code)]
+        {
+            for (ri, r) in reads.iter().enumerate() {
+                self.hash_one(ri, r, &mut f);
+            }
+            Ok(())
+        }
+    }
+
+    /// Scalar single-read roll (also the reference for the SIMD kernels).
+    fn hash_one<F: FnMut(usize, usize, u64)>(&self, ri: usize, read: &[u8], f: &mut F) {
+        let k = self.k as usize;
+        let fwd = base_forward_hash(read, self.k);
+        let rev = base_reverse_hash(read, self.k);
+        f(ri, 0, canonical(fwd, rev));
+        self.roll_tail(ri, read, k, fwd, rev, f);
+    }
+
+    /// Continue a scalar roll from `(fwd, rev)`, whose k-mer ends just before
+    /// `from`, to the end of the read. Shared by [`hash_one`](Self::hash_one)
+    /// and every SIMD kernel's ragged tail.
+    #[inline]
+    fn roll_tail<F: FnMut(usize, usize, u64)>(
+        &self,
+        ri: usize,
+        read: &[u8],
+        from: usize,
+        mut fwd: u64,
+        mut rev: u64,
+        f: &mut F,
+    ) {
+        let k = self.k as usize;
+        let c = &self.consts;
+        for i in from..read.len() {
+            let (nf, nr) = roll_forward(c, fwd, rev, roll_index(read[i - k], read[i]));
+            fwd = nf;
+            rev = nr;
+            f(ri, i - k + 1, canonical(fwd, rev));
+        }
+    }
+
+    /// AVX-512F: roll eight reads per group.
+    ///
+    /// Each step resolves both 16-entry roll tables with one `vpermi2q` and
+    /// rolls all eight lanes; the eight hashes of a step are buffered and
+    /// handed to `f` a block at a time, so the callback never sits between the
+    /// vector store and the scalar reads of the same value.
+    ///
+    /// # Safety
+    /// Requires AVX-512F.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn hash_reads_avx512<F: FnMut(usize, usize, u64)>(&self, reads: &[&[u8]], f: &mut F) {
+        use crate::simd::{load_table_x8, roll_index_x8, roll_x8, seed_x8, LANES_X8};
+        use std::arch::x86_64::*;
+
+        /// Eight bases of each lane at `off`, one `u64` per lane.
+        #[inline]
+        #[target_feature(enable = "avx512f")]
+        unsafe fn lane_words(group: &[&[u8]], off: usize) -> __m512i {
+            let w = |lane: usize| -> i64 {
+                (group.get_unchecked(lane).as_ptr().add(off) as *const u64)
+                    .read_unaligned()
+                    .to_le() as i64
+            };
+            _mm512_set_epi64(w(7), w(6), w(5), w(4), w(3), w(2), w(1), w(0))
+        }
+
+        let k = self.k as usize;
+        let len = reads[0].len();
+        let fq = load_table_x8(&self.consts.fwd_q);
+        let rq = load_table_x8(&self.consts.rev_q);
+        // `vpermi2q` selects from sixteen; only codes 0..4 are ever used.
+        let mut seed16 = [0u64; 16];
+        let mut seed_rc16 = [0u64; 16];
+        seed16[..4].copy_from_slice(&self.consts.seed);
+        seed_rc16[..4].copy_from_slice(&self.consts.seed_rc);
+
+        let mut seed_f = [0u64; LANES_X8];
+        let mut seed_r = [0u64; LANES_X8];
+        let mut block = [0u64; LANES_X8 * 8];
+
+        let mut base = 0;
+        while base + LANES_X8 <= reads.len() {
+            let group = &reads[base..base + LANES_X8];
+            // Seed all eight lanes on one chain; `seed_x8` needs a whole word
+            // to work with, so very short reads keep the scalar seeding.
+            let (mut fwd, mut rev) = if len >= 8 {
+                seed_x8(k, len, |off| lane_words(group, off), &seed16, &seed_rc16)
+            } else {
+                for (lane, r) in group.iter().enumerate() {
+                    seed_f[lane] = base_forward_hash(r, self.k);
+                    seed_r[lane] = base_reverse_hash(r, self.k);
+                }
+                (
+                    _mm512_loadu_si512(seed_f.as_ptr() as *const __m512i),
+                    _mm512_loadu_si512(seed_r.as_ptr() as *const __m512i),
+                )
+            };
+            _mm512_storeu_si512(seed_f.as_mut_ptr() as *mut __m512i, fwd);
+            _mm512_storeu_si512(seed_r.as_mut_ptr() as *mut __m512i, rev);
+            for lane in 0..LANES_X8 {
+                f(base + lane, 0, canonical(seed_f[lane], seed_r[lane]));
+            }
+
+            let mut i = k;
+            while i + 8 <= len {
+                // One load per lane per stream covers the next eight steps.
+                let mut ow = lane_words(group, i - k);
+                let mut iw = lane_words(group, i);
+                for e in 0..8 {
+                    let (nf, nr) = roll_x8(fwd, rev, roll_index_x8(ow, iw), fq, rq);
+                    fwd = nf;
+                    rev = nr;
+                    _mm512_storeu_si512(
+                        block.as_mut_ptr().add(e * LANES_X8) as *mut __m512i,
+                        _mm512_add_epi64(fwd, rev),
+                    );
+                    ow = _mm512_srli_epi64::<8>(ow);
+                    iw = _mm512_srli_epi64::<8>(iw);
+                }
+                for e in 0..8 {
+                    let pos = i - k + 1 + e;
+                    for lane in 0..LANES_X8 {
+                        f(base + lane, pos, *block.get_unchecked(e * LANES_X8 + lane));
+                    }
+                }
+                i += 8;
+            }
+            if i < len {
+                _mm512_storeu_si512(seed_f.as_mut_ptr() as *mut __m512i, fwd);
+                _mm512_storeu_si512(seed_r.as_mut_ptr() as *mut __m512i, rev);
+                for (lane, r) in group.iter().enumerate() {
+                    self.roll_tail(base + lane, r, i, seed_f[lane], seed_r[lane], f);
+                }
+            }
+            base += LANES_X8;
+        }
+        for (offset, r) in reads[base..].iter().enumerate() {
+            self.hash_one(base + offset, r, f);
+        }
+    }
+
+    /// AVX2: the same eight-read group as the AVX-512 kernel, driven as two
+    /// 256-bit halves. The roll table is read with a gather — 128 bytes, always
+    /// L1-resident — because a 16-way blend tree costs 15 `vpblendvb` and is
+    /// slower than rolling the reads one at a time.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn hash_reads_avx2<F: FnMut(usize, usize, u64)>(&self, reads: &[&[u8]], f: &mut F) {
+        use crate::simd::{roll_index_x4, roll_x4, LANES_X4};
+        use std::arch::x86_64::*;
+
+        const LANES: usize = 2 * LANES_X4;
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn lane_words(group: &[&[u8]], half: usize, off: usize) -> __m256i {
+            let w = |lane: usize| -> i64 {
+                (group
+                    .get_unchecked(half * LANES_X4 + lane)
+                    .as_ptr()
+                    .add(off) as *const u64)
+                    .read_unaligned()
+                    .to_le() as i64
+            };
+            _mm256_set_epi64x(w(3), w(2), w(1), w(0))
+        }
+
+        let k = self.k as usize;
+        let len = reads[0].len();
+        let fq = self.consts.fwd_q.as_ptr() as *const i64;
+        let rq = self.consts.rev_q.as_ptr() as *const i64;
+
+        let mut seed_f = [0u64; LANES];
+        let mut seed_r = [0u64; LANES];
+        let mut block = [0u64; LANES * 8];
+
+        let mut base = 0;
+        while base + LANES <= reads.len() {
+            let group = &reads[base..base + LANES];
+            for (lane, r) in group.iter().enumerate() {
+                seed_f[lane] = base_forward_hash(r, self.k);
+                seed_r[lane] = base_reverse_hash(r, self.k);
+                f(base + lane, 0, canonical(seed_f[lane], seed_r[lane]));
+            }
+            let mut fwd = [
+                _mm256_loadu_si256(seed_f.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(seed_f.as_ptr().add(LANES_X4) as *const __m256i),
+            ];
+            let mut rev = [
+                _mm256_loadu_si256(seed_r.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(seed_r.as_ptr().add(LANES_X4) as *const __m256i),
+            ];
+
+            let mut i = k;
+            while i + 8 <= len {
+                let mut ow = [lane_words(group, 0, i - k), lane_words(group, 1, i - k)];
+                let mut iw = [lane_words(group, 0, i), lane_words(group, 1, i)];
+                for e in 0..8 {
+                    for h in 0..2 {
+                        let (nf, nr) = roll_x4(fwd[h], rev[h], roll_index_x4(ow[h], iw[h]), fq, rq);
+                        fwd[h] = nf;
+                        rev[h] = nr;
+                        _mm256_storeu_si256(
+                            block.as_mut_ptr().add(e * LANES + h * LANES_X4) as *mut __m256i,
+                            _mm256_add_epi64(fwd[h], rev[h]),
+                        );
+                        ow[h] = _mm256_srli_epi64::<8>(ow[h]);
+                        iw[h] = _mm256_srli_epi64::<8>(iw[h]);
+                    }
+                }
+                for e in 0..8 {
+                    let pos = i - k + 1 + e;
+                    for lane in 0..LANES {
+                        f(base + lane, pos, *block.get_unchecked(e * LANES + lane));
+                    }
+                }
+                i += 8;
+            }
+            if i < len {
+                for h in 0..2 {
+                    _mm256_storeu_si256(
+                        seed_f.as_mut_ptr().add(h * LANES_X4) as *mut __m256i,
+                        fwd[h],
+                    );
+                    _mm256_storeu_si256(
+                        seed_r.as_mut_ptr().add(h * LANES_X4) as *mut __m256i,
+                        rev[h],
+                    );
+                }
+                for (lane, r) in group.iter().enumerate() {
+                    self.roll_tail(base + lane, r, i, seed_f[lane], seed_r[lane], f);
+                }
+            }
+            base += LANES;
+        }
+        for (offset, r) in reads[base..].iter().enumerate() {
+            self.hash_one(base + offset, r, f);
+        }
+    }
+
+    /// NEON: roll four reads per group as two 128-bit lane-pairs.
+    ///
+    /// # Safety
+    /// Requires NEON.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn hash_reads_neon<F: FnMut(usize, usize, u64)>(&self, reads: &[&[u8]], f: &mut F) {
         let mut base = 0;
         while base + LANES <= reads.len() {
             let group: [&[u8]; LANES] = [
@@ -103,179 +390,11 @@ impl ReadHasher {
                 reads[base + 2],
                 reads[base + 3],
             ];
-            self.hash_group(base, &group, &mut f);
+            self.hash_group_neon(base, &group, f);
             base += LANES;
         }
         for (offset, r) in reads[base..].iter().enumerate() {
-            self.hash_one(base + offset, r, &mut f);
-        }
-        Ok(())
-    }
-
-    /// Scalar single-read roll (also the reference for the SIMD kernel).
-    fn hash_one<F: FnMut(usize, usize, u64)>(&self, ri: usize, read: &[u8], f: &mut F) {
-        let k = self.k as usize;
-        let c = &self.consts;
-        let mut fwd = base_forward_hash(read, self.k);
-        let mut rev = base_reverse_hash(read, self.k);
-        f(ri, 0, canonical(fwd, rev));
-        for i in k..read.len() {
-            let out = base_code(read[i - k]);
-            let inc = base_code(read[i]);
-            fwd = srol(fwd) ^ c.seed[inc] ^ c.srolk[out];
-            rev = sror(rev ^ c.srolk_rc[inc] ^ c.seed_rc[out]);
-            f(ri, i - k + 1, canonical(fwd, rev));
-        }
-    }
-
-    /// Hash a full group of `LANES` reads, dispatching to SIMD when available.
-    fn hash_group<F: FnMut(usize, usize, u64)>(
-        &self,
-        base: usize,
-        group: &[&[u8]; LANES],
-        f: &mut F,
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                // SAFETY: guarded by run-time AVX2 detection.
-                unsafe { self.hash_group_avx2(base, group, f) };
-                return;
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                // SAFETY: guarded by run-time NEON detection (always true on the
-                // aarch64 baseline, checked for form).
-                unsafe { self.hash_group_neon(base, group, f) };
-                return;
-            }
-        }
-        for (lane, read) in group.iter().enumerate() {
-            self.hash_one(base + lane, read, f);
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn hash_group_avx2<F: FnMut(usize, usize, u64)>(
-        &self,
-        base: usize,
-        group: &[&[u8]; LANES],
-        f: &mut F,
-    ) {
-        use std::arch::x86_64::*;
-
-        let k = self.k as usize;
-        let len = group[0].len();
-        let c = &self.consts;
-
-        // Splat each 4-constant table into per-code AVX2 vectors.
-        let splat = |t: &[u64; 4]| {
-            [
-                _mm256_set1_epi64x(t[0] as i64),
-                _mm256_set1_epi64x(t[1] as i64),
-                _mm256_set1_epi64x(t[2] as i64),
-                _mm256_set1_epi64x(t[3] as i64),
-            ]
-        };
-        let seed = splat(&c.seed);
-        let srolk = splat(&c.srolk);
-        let srolk_rc = splat(&c.srolk_rc);
-        let seed_rc = splat(&c.seed_rc);
-
-        // Select `t[code_lane]` per lane via two blends (2-bit code).
-        #[inline(always)]
-        unsafe fn select4(t: &[__m256i; 4], code: __m256i) -> __m256i {
-            let one = _mm256_set1_epi64x(1);
-            let m0 = _mm256_cmpeq_epi64(_mm256_and_si256(code, one), one);
-            let lo = _mm256_blendv_epi8(t[0], t[1], m0);
-            let hi = _mm256_blendv_epi8(t[2], t[3], m0);
-            let m1 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_srli_epi64(code, 1), one), one);
-            _mm256_blendv_epi8(lo, hi, m1)
-        }
-
-        #[inline(always)]
-        unsafe fn srol_avx2(x: __m256i) -> __m256i {
-            let shifted = _mm256_and_si256(
-                _mm256_slli_epi64(x, 1),
-                _mm256_set1_epi64x(0xFFFF_FFFD_FFFF_FFFFu64 as i64),
-            );
-            let hi = _mm256_srli_epi64(
-                _mm256_and_si256(x, _mm256_set1_epi64x(0x8000_0000_0000_0000u64 as i64)),
-                30,
-            );
-            let lo = _mm256_srli_epi64(
-                _mm256_and_si256(x, _mm256_set1_epi64x(0x0000_0001_0000_0000u64 as i64)),
-                32,
-            );
-            _mm256_or_si256(shifted, _mm256_or_si256(hi, lo))
-        }
-
-        #[inline(always)]
-        unsafe fn sror_avx2(x: __m256i) -> __m256i {
-            let shifted = _mm256_and_si256(
-                _mm256_srli_epi64(x, 1),
-                _mm256_set1_epi64x(0xFFFF_FFFE_FFFF_FFFFu64 as i64),
-            );
-            let hi = _mm256_slli_epi64(
-                _mm256_and_si256(x, _mm256_set1_epi64x(0x0000_0002_0000_0000u64 as i64)),
-                30,
-            );
-            let lo = _mm256_slli_epi64(
-                _mm256_and_si256(x, _mm256_set1_epi64x(0x0000_0000_0000_0001u64 as i64)),
-                32,
-            );
-            _mm256_or_si256(shifted, _mm256_or_si256(hi, lo))
-        }
-
-        // Per-lane 2-bit codes for one column, as an AVX2 vector.
-        #[inline(always)]
-        unsafe fn codes_at(group: &[&[u8]; LANES], i: usize) -> __m256i {
-            _mm256_set_epi64x(
-                base_code(group[3][i]) as i64,
-                base_code(group[2][i]) as i64,
-                base_code(group[1][i]) as i64,
-                base_code(group[0][i]) as i64,
-            )
-        }
-
-        // Seed each lane with the first k-mer's forward/reverse hash.
-        let mut fwd_arr = [0u64; LANES];
-        let mut rev_arr = [0u64; LANES];
-        for lane in 0..LANES {
-            fwd_arr[lane] = base_forward_hash(group[lane], self.k);
-            rev_arr[lane] = base_reverse_hash(group[lane], self.k);
-            f(base + lane, 0, canonical(fwd_arr[lane], rev_arr[lane]));
-        }
-        let mut fwd = _mm256_loadu_si256(fwd_arr.as_ptr() as *const __m256i);
-        let mut rev = _mm256_loadu_si256(rev_arr.as_ptr() as *const __m256i);
-
-        for i in k..len {
-            let out_code = codes_at(group, i - k);
-            let in_code = codes_at(group, i);
-
-            // fwd = srol(fwd) ^ seed[in] ^ srolk[out]
-            fwd = _mm256_xor_si256(
-                _mm256_xor_si256(srol_avx2(fwd), select4(&seed, in_code)),
-                select4(&srolk, out_code),
-            );
-            // rev = sror(rev ^ srolk_rc[in] ^ seed_rc[out])
-            let inner = _mm256_xor_si256(
-                _mm256_xor_si256(rev, select4(&srolk_rc, in_code)),
-                select4(&seed_rc, out_code),
-            );
-            rev = sror_avx2(inner);
-
-            // canonical = fwd + rev (wrapping), per lane.
-            let canon = _mm256_add_epi64(fwd, rev);
-            _mm256_storeu_si256(fwd_arr.as_mut_ptr() as *mut __m256i, canon);
-            let pos = i - k + 1;
-            f(base, pos, fwd_arr[0]);
-            f(base + 1, pos, fwd_arr[1]);
-            f(base + 2, pos, fwd_arr[2]);
-            f(base + 3, pos, fwd_arr[3]);
+            self.hash_one(base + offset, r, f);
         }
     }
 
@@ -438,6 +557,120 @@ mod tests {
             })
             .unwrap();
         m
+    }
+
+    /// Deterministic pseudo-random N-free reads.
+    fn make_reads(n: usize, len: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|r| {
+                (0..len)
+                    .map(|i| b"ACGT"[(r * 7 + i * 5 + i / 3) % 4])
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn collect_scalar(h: &ReadHasher, reads: &[&[u8]]) -> BTreeMap<(usize, usize), u64> {
+        let mut m = BTreeMap::new();
+        for (ri, r) in reads.iter().enumerate() {
+            h.hash_one(ri, r, &mut |ri, pos, x| {
+                m.insert((ri, pos), x);
+            });
+        }
+        m
+    }
+
+    /// Every SIMD backend must agree with the scalar roll bit-for-bit, over
+    /// read counts that exercise a full lane group and a ragged tail, and read
+    /// lengths that exercise whole eight-step vector blocks plus a tail.
+    #[test]
+    fn simd_backends_match_scalar() {
+        // (8, 5) and (16, 9) straddle the eight-base word the SIMD seeding
+        // needs; (7, 33) and (3, 12) leave a ragged tail after the vector loop.
+        for &(n_reads, len) in &[
+            (20usize, 100usize),
+            (8, 40),
+            (7, 33),
+            (3, 12),
+            (16, 9),
+            (8, 5),
+            (9, 8),
+        ] {
+            let owned = make_reads(n_reads, len);
+            let reads: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+            for k in [1u16, 2, 4, 7, 9, 31, 40] {
+                if k as usize > len {
+                    continue;
+                }
+                let h = ReadHasher::new(k).unwrap();
+                let want = collect_scalar(&h, &reads);
+                assert_eq!(
+                    want,
+                    reference(&reads, k),
+                    "scalar vs blind k={k} len={len}"
+                );
+
+                let mut got = BTreeMap::new();
+                h.hash_reads(&reads, |ri, pos, x| {
+                    got.insert((ri, pos), x);
+                })
+                .unwrap();
+                assert_eq!(want, got, "dispatched backend k={k} len={len} n={n_reads}");
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if std::arch::is_x86_feature_detected!("avx2") {
+                        let mut v = BTreeMap::new();
+                        unsafe {
+                            h.hash_reads_avx2(&reads, &mut |ri, pos, x| {
+                                v.insert((ri, pos), x);
+                            })
+                        };
+                        assert_eq!(want, v, "avx2 k={k} len={len} n={n_reads}");
+                    }
+                    if std::arch::is_x86_feature_detected!("avx512f") {
+                        let mut v = BTreeMap::new();
+                        unsafe {
+                            h.hash_reads_avx512(&reads, &mut |ri, pos, x| {
+                                v.insert((ri, pos), x);
+                            })
+                        };
+                        assert_eq!(want, v, "avx512 k={k} len={len} n={n_reads}");
+                    }
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if std::arch::is_aarch64_feature_detected!("neon") {
+                        let mut v = BTreeMap::new();
+                        unsafe {
+                            h.hash_reads_neon(&reads, &mut |ri, pos, x| {
+                                v.insert((ri, pos), x);
+                            })
+                        };
+                        assert_eq!(want, v, "neon k={k} len={len} n={n_reads}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every k-mer of every read must be emitted exactly once.
+    #[test]
+    fn emits_each_kmer_once() {
+        let owned = make_reads(20, 100);
+        let reads: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        for k in [1u16, 7, 31] {
+            let mut count = 0usize;
+            let mut seen = BTreeMap::new();
+            ReadHasher::new(k)
+                .unwrap()
+                .hash_reads(&reads, |ri, pos, _| {
+                    count += 1;
+                    assert!(seen.insert((ri, pos), ()).is_none(), "duplicate {ri}/{pos}");
+                })
+                .unwrap();
+            assert_eq!(count, reads.len() * (100 - k as usize + 1), "k={k}");
+        }
     }
 
     #[test]

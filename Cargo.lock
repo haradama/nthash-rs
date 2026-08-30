@@ -350,6 +350,7 @@ dependencies = [
  "fxhash",
  "nthash",
  "proptest",
+ "rayon",
  "thiserror 2.0.12",
  "xxhash-rust",
 ]

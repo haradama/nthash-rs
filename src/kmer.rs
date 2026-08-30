@@ -14,8 +14,8 @@
 
 use crate::{
     constants::*,
-    tables::{base_code, srol, srol_n, sror, RollConsts},
-    util::{canonical, extend_hashes},
+    tables::{base_code, roll_forward, roll_index, srol, srol_const, srol_n, sror, RollConsts},
+    util::{canonical, extend_from_canonical, extend_from_canonical_n, extend_hashes},
     NtHashError, // unified crate-level error
 };
 
@@ -110,8 +110,14 @@ impl<'a> NtHash<'a> {
             return self.init_advance();
         }
         let outgoing = self.seq[self.pos];
-        self.fwd_hash = next_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
-        self.rev_hash = next_reverse_hash(&self.consts, self.rev_hash, outgoing, incoming);
+        let (f, r) = roll_forward(
+            &self.consts,
+            self.fwd_hash,
+            self.rev_hash,
+            roll_index(outgoing, incoming),
+        );
+        self.fwd_hash = f;
+        self.rev_hash = r;
         self.pos += 1;
         true
     }
@@ -158,8 +164,12 @@ impl<'a> NtHash<'a> {
             return false;
         }
         let outgoing = self.seq[self.pos];
-        let fwd = next_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
-        let rev = next_reverse_hash(&self.consts, self.rev_hash, outgoing, incoming);
+        let (fwd, rev) = roll_forward(
+            &self.consts,
+            self.fwd_hash,
+            self.rev_hash,
+            roll_index(outgoing, incoming),
+        );
         self.fill_hash_buffer(fwd, rev);
         true
     }
@@ -225,19 +235,16 @@ impl<'a> NtHash<'a> {
     /// Position on the first valid k‑mer, updating the forward/reverse hashes but
     /// not the materialized buffer.
     fn init_advance(&mut self) -> bool {
-        let k_usz = self.k as usize;
-        while self.pos <= self.seq.len() - k_usz {
-            let mut skip = 0;
-            if has_invalid_base(&self.seq[self.pos..], k_usz, &mut skip) {
-                self.pos += skip + 1;
-                continue;
+        match scan_to_valid(self.seq, self.k, self.pos) {
+            Some((pos, fwd, rev)) => {
+                self.pos = pos;
+                self.fwd_hash = fwd;
+                self.rev_hash = rev;
+                self.initialized = true;
+                true
             }
-            self.fwd_hash = base_forward_hash(&self.seq[self.pos..], self.k);
-            self.rev_hash = base_reverse_hash(&self.seq[self.pos..], self.k);
-            self.initialized = true;
-            return true;
+            None => false,
         }
-        false
     }
 
     #[inline(always)]
@@ -254,6 +261,31 @@ impl<'a> NtHash<'a> {
     fn fill_hash_buffer(&mut self, fwd: u64, rev: u64) {
         extend_hashes(fwd, rev, self.k as u32, &mut self.hashes);
     }
+}
+
+/// Scan forward from `pos` for the first k‑mer free of ambiguous bases,
+/// returning `(position, forward hash, reverse hash)`.
+///
+/// A free function rather than a method so the canonical fast path can call it
+/// on an `N`-skip without holding a `&mut` on the hasher — that borrow is what
+/// forces the rolling state back to memory on *every* k‑mer.
+///
+/// Requires `seq.len() >= k`, which every caller checks.
+fn scan_to_valid(seq: &[u8], k: u16, mut pos: usize) -> Option<(usize, u64, u64)> {
+    let k_usz = k as usize;
+    while pos <= seq.len() - k_usz {
+        let mut skip = 0;
+        if has_invalid_base(&seq[pos..], k_usz, &mut skip) {
+            pos += skip + 1;
+            continue;
+        }
+        return Some((
+            pos,
+            base_forward_hash(&seq[pos..], k),
+            base_reverse_hash(&seq[pos..], k),
+        ));
+    }
+    None
 }
 
 #[inline(always)]
@@ -275,7 +307,7 @@ pub fn base_forward_hash(seq: &[u8], k: u16) -> u64 {
     let mut h = 0_u64;
 
     for chunk in seq[..k - k % 4].chunks_exact(4) {
-        h = srol_n(h, 4);
+        h = srol_const::<4>(h);
 
         // build 0‑255 index with 8‑bit wrapping
         let idx = (CONVERT_TAB[chunk[0] as usize] as usize) * 64
@@ -333,7 +365,7 @@ pub fn base_reverse_hash(seq: &[u8], k: u16) -> u64 {
     let mut i = k - k % 4;
     while i >= 4 {
         // split‑rotate the accumulator by 4
-        h = srol_n(h, 4);
+        h = srol_const::<4>(h);
 
         // build 4‑mer index, mask to 8 bits
         let idx = (RC_CONVERT_TAB[seq[i - 1] as usize] as usize) * 64
@@ -348,24 +380,9 @@ pub fn base_reverse_hash(seq: &[u8], k: u16) -> u64 {
 }
 
 #[inline(always)]
-fn next_forward_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
-    let mut h = srol(prev);
-    h ^= c.seed[base_code(char_in)];
-    h ^= c.srolk[base_code(char_out)];
-    h
-}
-
-#[inline(always)]
 fn prev_forward_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
     let mut h = prev ^ c.srolk[base_code(char_in)];
     h ^= c.seed[base_code(char_out)];
-    sror(h)
-}
-
-#[inline(always)]
-fn next_reverse_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
-    let mut h = prev ^ c.srolk_rc[base_code(char_in)];
-    h ^= c.seed_rc[base_code(char_out)];
     sror(h)
 }
 
@@ -435,6 +452,21 @@ pub struct NtHashIter<'a> {
 }
 
 impl<'a> NtHashIter<'a> {
+    /// Wrap an already-built hasher.
+    ///
+    /// [`minimizer`](crate::minimizer) uses this to reach
+    /// [`for_each_canonical`](Self::for_each_canonical), whose loop keeps the
+    /// rolling state in locals — something a sibling module cannot do itself,
+    /// because it can only reach the hasher through `&mut self` methods that
+    /// pin the state to memory.
+    #[inline]
+    pub(crate) fn from_hasher(hasher: NtHash<'a>) -> Self {
+        Self {
+            hasher,
+            done: false,
+        }
+    }
+
     /// Drive the hasher to completion, invoking `f(pos, &hashes)` for each
     /// valid k‑mer **without allocating**.
     ///
@@ -457,11 +489,113 @@ impl<'a> NtHashIter<'a> {
     /// ```
     #[inline]
     pub fn for_each_hash<F: FnMut(usize, &[u64])>(mut self, mut f: F) {
+        // Route small, fixed counts to the const-sized driver: a `[u64; N]`
+        // local instead of the heap buffer, and a mixing loop the optimizer can
+        // unroll. This is where nearly every caller lands, and it is worth up
+        // to 2.5x at eight hashes per k-mer.
+        macro_rules! fixed {
+            ($($n:literal),*) => {
+                match self.hasher.hashes.len() {
+                    $( $n => return self.for_each_hash_n::<$n, _>(|p, h| f(p, h)), )*
+                    _ => {}
+                }
+            };
+        }
+        fixed!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+
         if self.done {
             return;
         }
-        while self.hasher.roll() {
-            f(self.hasher.pos(), self.hasher.hashes());
+        // Every extra hash is a function of the canonical value alone, so drive
+        // the canonical fast path — which keeps the rolling state in locals —
+        // and mix on top of it, instead of paying `roll`'s buffer round trip
+        // for a value we then rebuild anyway.
+        let k = self.hasher.k as u32;
+        let mut buf = std::mem::take(&mut self.hasher.hashes);
+        self.for_each_canonical(|pos, canon| {
+            extend_from_canonical(canon, k, &mut buf);
+            f(pos, &buf);
+        });
+    }
+
+    /// [`for_each_hash`](Self::for_each_hash) with the hash count known at
+    /// compile time.
+    ///
+    /// `N` replaces the builder's `num_hashes`: the buffer is a `[u64; N]`
+    /// local rather than a heap `Vec`, and the mixing loop unrolls. Prefer it
+    /// whenever the count is a constant.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use nthash_rs::NtHashBuilder;
+    /// # fn main() -> nthash_rs::Result<()> {
+    /// let mut n = 0usize;
+    /// NtHashBuilder::new(b"ACGTACGTACGT").k(4).finish()?
+    ///     .for_each_hash_n::<3, _>(|_pos, hashes| n += hashes.len());
+    /// assert_eq!(n, 3 * (12 - 4 + 1));
+    /// # Ok(()) }
+    /// ```
+    #[inline]
+    pub fn for_each_hash_n<const N: usize, F: FnMut(usize, &[u64; N])>(self, mut f: F) {
+        let k = self.hasher.k as u32;
+        let mut buf = [0u64; N];
+        self.for_each_canonical(|pos, canon| {
+            extend_from_canonical_n::<N>(canon, k, &mut buf);
+            f(pos, &buf);
+        });
+    }
+
+    /// [`for_each_canonical`](Self::for_each_canonical) with both hash chains
+    /// in one 128-bit register.
+    ///
+    /// # Safety
+    /// Requires AVX-512F and AVX-512VL.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512vl")]
+    unsafe fn for_each_canonical_x2<F: FnMut(usize, u64)>(mut self, mut f: F) {
+        use crate::simd::{canonical_x2, pack_x2, roll2, roll_x2, unpack_x2};
+        use std::arch::x86_64::*;
+
+        let h = &mut self.hasher;
+        let seq = h.seq;
+        let k = h.k as usize;
+        let len = seq.len();
+        if len < k {
+            return;
+        }
+        let last = len - k;
+        if !h.advance() {
+            return;
+        }
+        let c = roll2();
+        let mut pos = h.pos;
+        let mut x = pack_x2(h.fwd_hash, h.rev_hash);
+        loop {
+            f(pos, canonical_x2(x));
+            if pos >= last {
+                return;
+            }
+            let incoming = seq[pos + k];
+            if SEED_TAB[incoming as usize] == SEED_N {
+                // N-skip: hand the state back to the hasher, re-seed through
+                // the shared scan, and reload.
+                let (fwd, rev) = unpack_x2(x);
+                h.fwd_hash = fwd;
+                h.rev_hash = rev;
+                h.pos = pos + k;
+                h.initialized = false;
+                if !h.advance() {
+                    return;
+                }
+                pos = h.pos;
+                x = pack_x2(h.fwd_hash, h.rev_hash);
+                continue;
+            }
+            let q = roll_index(seq[pos], incoming) & 15;
+            let d = _mm_loadu_si128(h.consts.fr_q.as_ptr().add(2 * q) as *const __m128i);
+            x = roll_x2(x, d, &c);
+            pos += 1;
         }
     }
 
@@ -478,6 +612,19 @@ impl<'a> NtHashIter<'a> {
     pub fn for_each_canonical<F: FnMut(usize, u64)>(mut self, mut f: F) {
         if self.done {
             return;
+        }
+        // Both chains fit in one 128-bit register where a per-lane variable
+        // rotate exists, which cuts the per-k-mer dependency chain from five
+        // cycles to three. Bit-identical to the scalar loop below.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512vl")
+            {
+                // SAFETY: guarded by run-time AVX-512F/VL detection.
+                unsafe { self.for_each_canonical_x2(f) };
+                return;
+            }
         }
         let h = &mut self.hasher;
         let seq = h.seq;
@@ -511,8 +658,14 @@ impl<'a> NtHashIter<'a> {
                 continue;
             }
             let outgoing = seq[h.pos];
-            h.fwd_hash = next_forward_hash(&h.consts, h.fwd_hash, outgoing, incoming);
-            h.rev_hash = next_reverse_hash(&h.consts, h.rev_hash, outgoing, incoming);
+            let (nf, nr) = roll_forward(
+                &h.consts,
+                h.fwd_hash,
+                h.rev_hash,
+                roll_index(outgoing, incoming),
+            );
+            h.fwd_hash = nf;
+            h.rev_hash = nr;
             h.pos += 1;
         }
     }
@@ -540,5 +693,46 @@ impl<'a> IntoIterator for NtHashBuilder<'a> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.finish().expect("invalid NtHashBuilder configuration")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `for_each_canonical` — dispatched to whichever backend the CPU has —
+    /// must emit exactly the positions and canonical hashes the pull-based
+    /// `Iterator` does, including across `N`-skips.
+    #[test]
+    fn for_each_canonical_matches_iterator() {
+        let seqs: [&[u8]; 5] = [
+            b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT",
+            b"ACGTNNNNACGTACGTNACGGATTACAGGGCCCTTTAAACGT",
+            b"NNNNNNNNNNNNNNNN",
+            b"NNNNACGTACGTACGTNNNN",
+            b"ACGTNACGTNACGTNACGTNACGTNACGTN",
+        ];
+        for seq in seqs {
+            for k in [1u16, 2, 4, 7, 16] {
+                if (k as usize) > seq.len() {
+                    continue;
+                }
+                let pulled: Vec<(usize, u64)> = NtHashBuilder::new(seq)
+                    .k(k)
+                    .num_hashes(1)
+                    .finish()
+                    .unwrap()
+                    .map(|(p, h)| (p, h[0]))
+                    .collect();
+                let mut pushed = Vec::new();
+                NtHashBuilder::new(seq)
+                    .k(k)
+                    .num_hashes(1)
+                    .finish()
+                    .unwrap()
+                    .for_each_canonical(|p, h| pushed.push((p, h)));
+                assert_eq!(pulled, pushed, "k={k} seq={seq:?}");
+            }
+        }
     }
 }

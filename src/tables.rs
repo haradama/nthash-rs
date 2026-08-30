@@ -51,6 +51,26 @@ pub const fn srol_n(x: u64, d: u32) -> u64 {
     v ^ (y | (y << 33))
 }
 
+/// [`srol_n`] specialised to a compile-time distance `D` in `1..31`.
+///
+/// The generic form rotates the whole word and then repairs the bits that
+/// crossed the 33/31 boundary — a seven-op chain six cycles deep. Rotating the
+/// two fields directly is four cycles deep, and this sits on a *serial* chain:
+/// [`base_forward_hash`](crate::kmer::base_forward_hash) is `k/4` of these back
+/// to back, which is ~40% of batch hashing for 100 bp reads.
+///
+/// `D` must be in `1..31`; outside that range the 31-bit field would wrap more
+/// than once and the masks below no longer describe the rotation. A unit test
+/// pins every valid `D` against [`srol_n`].
+#[inline(always)]
+pub const fn srol_const<const D: u32>(x: u64) -> u64 {
+    let m = (1u64 << D) - 1;
+    // Everything that stays inside its own field, then each field's wrap-around.
+    ((x << D) & !(m | (m << 33)))       // bits D..32 and 33+D..63
+        | ((x >> (33 - D)) & m)         // lower field: bits 33-D..32 -> 0..D-1
+        | ((x >> (31 - D)) & (m << 33)) // upper field: bits 64-D..63 -> 33..33+D-1
+}
+
 /// One‑bit split‑rotate right (33 + 31 bit halves).
 ///
 /// Inverse of [`srol`].  Rotates each half right by one bit, exchanging:
@@ -130,6 +150,11 @@ pub fn base_code(b: u8) -> usize {
 /// roll hot-path than a variable-index load into a 2 KiB table, and — unlike
 /// the table — needs no heap allocation, which matters when a fresh hasher is
 /// built per short read.
+///
+/// The four separate tables are what the *backward* roll needs (it pairs them
+/// the other way round). The *forward* roll — the hot direction — instead uses
+/// the pre-folded [`fwd_q`](Self::fwd_q) / [`rev_q`](Self::rev_q) pair; see
+/// [`roll_index`].
 #[derive(Clone)]
 pub struct RollConsts {
     /// `SEED_TAB[base]` — forward incoming contribution.
@@ -140,16 +165,39 @@ pub struct RollConsts {
     pub srolk_rc: [u64; 4],
     /// `SEED_TAB[base & CP_OFF]` — reverse outgoing contribution.
     pub seed_rc: [u64; 4],
+    /// `srolk[out] ^ seed[in]`, indexed by [`roll_index`]`(out, in)`.
+    pub fwd_q: [u64; 16],
+    /// `srolk_rc[in] ^ seed_rc[out]`, indexed by the same [`roll_index`].
+    pub rev_q: [u64; 16],
+    /// `[fwd_q[q], sror(rev_q[q])]` interleaved, for the 128-bit dual-chain
+    /// roll (`simd::roll_x2`). The reverse delta is pre-rotated because that
+    /// form computes `sror(rev) ^ delta` rather than `sror(rev ^ delta)` —
+    /// equal by linearity, and it takes the XOR off the dependency chain.
+    pub fr_q: [u64; 32],
+}
+
+/// Index into [`RollConsts::fwd_q`] / [`RollConsts::rev_q`] for one roll step:
+/// the outgoing base's 2-bit code in bits 2-3, the incoming base's in bits 0-1.
+///
+/// `base_code(b)` is `(b >> 1) & 3`, so `base_code(out) * 4` is just
+/// `(out & 6) << 1` — no shift-then-shift round trip. Non-ACGT bytes are out of
+/// contract exactly as for [`base_code`].
+#[inline(always)]
+pub const fn roll_index(char_out: u8, char_in: u8) -> usize {
+    ((char_out as usize & 6) << 1) | ((char_in as usize >> 1) & 3)
 }
 
 impl RollConsts {
-    /// Precompute the four per-base constants for k-mer length `k`.
+    /// Precompute the per-base and per-base-pair constants for k-mer length `k`.
     pub fn new(k: u16) -> Self {
         let mut c = RollConsts {
             seed: [0; 4],
             srolk: [0; 4],
             srolk_rc: [0; 4],
             seed_rc: [0; 4],
+            fwd_q: [0; 16],
+            rev_q: [0; 16],
+            fr_q: [0; 32],
         };
         for &b in b"ACGT" {
             let i = base_code(b);
@@ -158,8 +206,35 @@ impl RollConsts {
             c.srolk_rc[i] = srol_table(b & CP_OFF, k as u32);
             c.seed_rc[i] = SEED_TAB[(b & CP_OFF) as usize];
         }
+        // Fold each (outgoing, incoming) pair into a single delta. The roll is
+        // latency- not throughput-bound, so removing one XOR from each of the
+        // forward and reverse dependency chains is the whole scalar win.
+        for out in 0..4 {
+            for inc in 0..4 {
+                c.fwd_q[out * 4 + inc] = c.srolk[out] ^ c.seed[inc];
+                c.rev_q[out * 4 + inc] = c.srolk_rc[inc] ^ c.seed_rc[out];
+            }
+        }
+        for q in 0..16 {
+            c.fr_q[2 * q] = c.fwd_q[q];
+            c.fr_q[2 * q + 1] = sror(c.rev_q[q]);
+        }
         c
     }
+}
+
+/// One forward roll step: `(srol(fwd) ^ fwd_q[q], sror(rev ^ rev_q[q]))`.
+///
+/// Both chains are one XOR shorter than the equivalent pair of
+/// [`RollConsts::seed`]/[`RollConsts::srolk`] lookups.
+#[inline(always)]
+pub fn roll_forward(c: &RollConsts, fwd: u64, rev: u64, q: usize) -> (u64, u64) {
+    debug_assert!(q < 16);
+    // SAFETY-equivalent: `roll_index` can only produce 0..16, and the debug
+    // assertion above guards hand-built indices.
+    let fd = c.fwd_q[q & 15];
+    let rd = c.rev_q[q & 15];
+    (srol(fwd) ^ fd, sror(rev ^ rd))
 }
 
 #[cfg(test)]
@@ -336,6 +411,71 @@ mod tests {
         assert_eq!(srol_table(4, 32), 0x7917_F764_CAE3_023A);
         assert_eq!(srol_table(3, 30), 0x1019_1F69_104A_E464);
         assert_eq!(srol_table(0, 33), 0x0000_0000_0000_0000);
+    }
+
+    /// `srol_const::<D>` must equal `srol_n(_, D)` for every valid `D`.
+    #[test]
+    fn srol_const_matches_srol_n() {
+        const XS: [u64; 8] = [
+            0,
+            1,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0x0000_0001_0000_0000,
+            0x0000_0002_0000_0000,
+            0x8000_0000_0000_0000,
+            0x0123_4567_89AB_CDEF,
+            0xDEAD_BEEF_CAFE_F00D,
+        ];
+        seq_macro_like(&XS);
+
+        fn seq_macro_like(xs: &[u64; 8]) {
+            macro_rules! check {
+                ($($d:literal),*) => { $(
+                    for &x in xs {
+                        assert_eq!(srol_const::<$d>(x), srol_n(x, $d), "d={} x={x:#x}", $d);
+                    }
+                )* };
+            }
+            check!(
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 30
+            );
+        }
+    }
+
+    /// The folded `fwd_q`/`rev_q` tables must agree with the four separate
+    /// per-base tables for every (outgoing, incoming) A/C/G/T pair.
+    #[test]
+    fn fused_tables_match_split_tables() {
+        for k in [1u16, 2, 7, 31, 32, 33, 64, 1023, 1024] {
+            let c = RollConsts::new(k);
+            for &o in b"ACGTacgt" {
+                for &i in b"ACGTacgtUu" {
+                    let q = roll_index(o, i);
+                    let (oc, ic) = (base_code(o), base_code(i));
+                    assert_eq!(q, oc * 4 + ic, "k={k} o={o} i={i}");
+                    assert_eq!(c.fwd_q[q], c.srolk[oc] ^ c.seed[ic], "fwd k={k}");
+                    assert_eq!(c.rev_q[q], c.srolk_rc[ic] ^ c.seed_rc[oc], "rev k={k}");
+                }
+            }
+        }
+    }
+
+    /// `roll_forward` must equal the un-fused split-table roll.
+    #[test]
+    fn roll_forward_matches_split_roll() {
+        for k in [3u16, 21, 31] {
+            let c = RollConsts::new(k);
+            let (mut f, mut r) = (0xDEAD_BEEF_1234_5678u64, 0x0FED_CBA9_8765_4321u64);
+            for (o, i) in b"ACGTACGTGGTTAACC".iter().zip(b"TTGGCCAAACGTACGT".iter()) {
+                let want_f = srol(f) ^ c.seed[base_code(*i)] ^ c.srolk[base_code(*o)];
+                let want_r = sror(r ^ c.srolk_rc[base_code(*i)] ^ c.seed_rc[base_code(*o)]);
+                let (gf, gr) = roll_forward(&c, f, r, roll_index(*o, *i));
+                assert_eq!((gf, gr), (want_f, want_r), "k={k}");
+                f = gf;
+                r = gr;
+            }
+        }
     }
 
     /// `srol` followed by `sror` repeatedly should restore the original value.

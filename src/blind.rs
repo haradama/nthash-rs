@@ -22,7 +22,7 @@ use crate::{
     constants::{CP_OFF, SEED_TAB},
     kmer::{base_forward_hash, base_reverse_hash},
     tables::{build_srol_k, srol, sror},
-    util::{canonical, extend_hashes},
+    util::{canonical, extend_from_canonical, extend_from_canonical_n, extend_hashes},
     NtHashError, Result,
 };
 
@@ -192,6 +192,14 @@ fn prev_reverse_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) 
     srol(prev) ^ SEED_TAB[(char_in & CP_OFF) as usize] ^ srol_k[(char_out & CP_OFF) as usize]
 }
 
+/// Shortest sequence for which building the 128-bit delta tables pays off.
+///
+/// The two 4 KiB tables cost ~500 cycles to fill and the driver saves ~0.9
+/// cycles per base, so the measured crossover is between 512 and 768 bases;
+/// this leaves margin.
+#[cfg(target_arch = "x86_64")]
+const X2_MIN_LEN: usize = 1024;
+
 pub struct BlindNtHashBuilder<'a> {
     seq: &'a [u8],
     k: u16,
@@ -253,15 +261,87 @@ impl<'a> BlindNtHashIter<'a> {
     /// [`NtHashIter::for_each_hash`](crate::kmer::NtHashIter::for_each_hash).
     #[inline]
     pub fn for_each_hash<F: FnMut(usize, &[u64])>(mut self, mut f: F) {
+        // Route small, fixed counts to the const-sized driver: a `[u64; N]`
+        // local instead of the heap buffer, and a mixing loop the optimizer can
+        // unroll. This is where nearly every caller lands, and it is worth up
+        // to 2.5x at eight hashes per k-mer.
+        macro_rules! fixed {
+            ($($n:literal),*) => {
+                match self.hasher.hashes.len() {
+                    $( $n => return self.for_each_hash_n::<$n, _>(|p, h| f(p, h)), )*
+                    _ => {}
+                }
+            };
+        }
+        fixed!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+
+        // The extra hashes derive from the canonical value alone, so ride the
+        // canonical fast path — which skips the `VecDeque` window entirely —
+        // and mix on top of it.
+        let k = self.hasher.k as u32;
+        let mut buf = std::mem::take(&mut self.hasher.hashes);
+        self.for_each_canonical(|pos, canon| {
+            extend_from_canonical(canon, k, &mut buf);
+            f(pos, &buf);
+        });
+    }
+
+    /// [`for_each_hash`](Self::for_each_hash) with the hash count known at
+    /// compile time; see
+    /// [`NtHashIter::for_each_hash_n`](crate::kmer::NtHashIter::for_each_hash_n).
+    #[inline]
+    pub fn for_each_hash_n<const N: usize, F: FnMut(usize, &[u64; N])>(self, mut f: F) {
+        let k = self.hasher.k as u32;
+        let mut buf = [0u64; N];
+        self.for_each_canonical(|pos, canon| {
+            extend_from_canonical_n::<N>(canon, k, &mut buf);
+            f(pos, &buf);
+        });
+    }
+
+    /// [`for_each_canonical`](Self::for_each_canonical) with both hash chains
+    /// in one 128-bit register.
+    ///
+    /// # Safety
+    /// Requires AVX-512F and AVX-512VL.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512vl")]
+    unsafe fn for_each_canonical_x2<F: FnMut(usize, u64)>(mut self, mut f: F) {
+        use crate::simd::{canonical_x2, pack_x2, roll2, roll_x2};
+        use std::arch::x86_64::*;
+
+        let seq = self.seq;
+        let end = self.end;
+        let k = self.hasher.k as usize;
+
+        // Per-window delta, split so it is one XOR of two loads:
+        //   forward: SEED_TAB[in] ^ srol_k[out]
+        //   reverse: sror(srol_k[in & CP]) ^ sror(SEED_TAB[out & CP])
+        // The reverse half is pre-`sror`ed because `roll_x2` computes
+        // `sror(rev) ^ delta`, equal by linearity and one XOR shorter.
+        let mut tab_in = vec![[0u64; 2]; 256];
+        let mut tab_out = vec![[0u64; 2]; 256];
+        for c in 0..256usize {
+            let cp = (c as u8 & CP_OFF) as usize;
+            tab_in[c] = [SEED_TAB[c], sror(self.hasher.srol_k[cp])];
+            tab_out[c] = [self.hasher.srol_k[c], sror(SEED_TAB[cp])];
+        }
+
+        let rc = roll2();
+        let mut pos = self.hasher.pos as usize;
+        let mut x = pack_x2(self.hasher.fwd_hash, self.hasher.rev_hash);
         if self.first {
             self.first = false;
-            f(self.hasher.pos() as usize, self.hasher.hashes());
+            f(pos, canonical_x2(x));
         }
-        while (self.hasher.pos() as usize) < self.end {
-            let cur = self.hasher.pos() as usize;
-            let incoming = self.seq[cur + self.hasher.k as usize];
-            self.hasher.roll(incoming);
-            f(self.hasher.pos() as usize, self.hasher.hashes());
+        while pos < end {
+            let d = _mm_xor_si128(
+                _mm_loadu_si128(tab_in.as_ptr().add(seq[pos + k] as usize) as *const __m128i),
+                _mm_loadu_si128(tab_out.as_ptr().add(seq[pos] as usize) as *const __m128i),
+            );
+            x = roll_x2(x, d, &rc);
+            pos += 1;
+            f(pos, canonical_x2(x));
         }
     }
 
@@ -276,6 +356,22 @@ impl<'a> BlindNtHashIter<'a> {
     /// window (the `num_hashes = 1` case).
     #[inline]
     pub fn for_each_canonical<F: FnMut(usize, u64)>(mut self, mut f: F) {
+        // Both chains in one 128-bit register, three cycles per window instead
+        // of five. Unlike `NtHash`, the delta cannot be a 16-entry table here —
+        // this variant hashes any byte, so it needs the full byte-indexed pair
+        // — and building those two 4 KiB tables costs ~500 cycles, which the
+        // 0.9 cycles/base saving repays after a few hundred bases.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.seq.len() >= X2_MIN_LEN
+                && std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512vl")
+            {
+                // SAFETY: guarded by run-time AVX-512F/VL detection.
+                unsafe { self.for_each_canonical_x2(f) };
+                return;
+            }
+        }
         let seq = self.seq;
         let end = self.end;
         let k = self.hasher.k as usize;
@@ -333,6 +429,42 @@ impl<'a> IntoIterator for BlindNtHashBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `for_each_canonical` must agree with the pull-based `Iterator` (which
+    /// rolls through the ring-buffer window) on both sides of the length
+    /// threshold that selects the 128-bit driver, and for `N`-bearing input —
+    /// this variant hashes ambiguous bases rather than skipping them.
+    #[test]
+    fn for_each_canonical_matches_iterator() {
+        let patterns: [&[u8]; 3] = [b"ACGT", b"ACGTN", b"ACGTNXacgtu"];
+        // 40/100 are below the threshold (scalar), 5000 above it (128-bit
+        // driver); 1024 sits exactly on it.
+        for len in [40usize, 100, 1024, 5000] {
+            for pat in patterns {
+                let seq: Vec<u8> = (0..len).map(|i| pat[i % pat.len()]).collect();
+                for k in [1u16, 4, 15, 31] {
+                    if k as usize > len {
+                        continue;
+                    }
+                    let pulled: Vec<(usize, u64)> = BlindNtHashBuilder::new(&seq)
+                        .k(k)
+                        .num_hashes(1)
+                        .finish()
+                        .unwrap()
+                        .map(|(p, h)| (p, h[0]))
+                        .collect();
+                    let mut pushed = Vec::new();
+                    BlindNtHashBuilder::new(&seq)
+                        .k(k)
+                        .num_hashes(1)
+                        .finish()
+                        .unwrap()
+                        .for_each_canonical(|p, h| pushed.push((p, h)));
+                    assert_eq!(pulled, pushed, "k={k} len={len} pat={pat:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn too_short_sequence_errors_without_panicking() {

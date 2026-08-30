@@ -2,7 +2,7 @@
 name             = "nthash-rs"
 version          = "0.1.3"
 edition          = "2021"
-description      = "Pure‑Rust port of ntHash"
+description      = "Pure-Rust port of ntHash"
 license          = "MIT"
 repository       = "https://github.com/haradama/nthash-rs"
 documentation    = "https://docs.rs/nthash-rs"
@@ -15,6 +15,11 @@ exclude          = ["fuzz"]
 
 [dependencies]
 thiserror   = "2.0.12"
+rayon       = { version = "1", optional = true }
+
+[features]
+# Multi-core hashing of a single long sequence (adds a `rayon` dependency).
+parallel = ["dep:rayon"]
 
 [dev-dependencies]
 ahash = "0.8.12"

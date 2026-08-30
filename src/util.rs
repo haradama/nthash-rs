@@ -67,22 +67,53 @@ pub const fn canonical(fwd: u64, rev: u64) -> u64 {
 /// ```
 #[inline]
 pub fn extend_hashes(fwd: u64, rev: u64, k: u32, hashes: &mut [u64]) {
+    extend_from_canonical(canonical(fwd, rev), k, hashes)
+}
+
+/// [`extend_hashes`] starting from an already-combined canonical hash.
+///
+/// Every extra hash is a pure function of the canonical value, so a driver that
+/// already has it — every `for_each_*` loop in this crate — should not
+/// re-derive it from the strand pair.
+#[inline]
+pub fn extend_from_canonical(base: u64, k: u32, hashes: &mut [u64]) {
     match hashes.len() {
         0 => return,
         1 => {
-            hashes[0] = canonical(fwd, rev);
+            hashes[0] = base;
             return;
         }
         _ => {}
     }
-
-    // Base (canonical) hash at index 0
-    let base = canonical(fwd, rev);
     hashes[0] = base;
 
     let seed = (k as u64).wrapping_mul(MULTISEED);
 
     // Compute extra hashes for i = 1 .. len−1
+    for (i, slot) in hashes.iter_mut().enumerate().skip(1) {
+        let mut h = base.wrapping_mul((i as u64) ^ seed);
+        h ^= h >> MULTISHIFT;
+        *slot = h;
+    }
+}
+
+/// Const-sized [`extend_from_canonical`].
+///
+/// With `N` known at compile time the mixing loop unrolls and the buffer can
+/// stay in registers, so a caller that knows its hash count statically pays
+/// neither the trip through a heap slice nor a loop whose trip count the
+/// optimizer cannot see. Used by
+/// [`NtHashIter::for_each_hash_n`](crate::kmer::NtHashIter::for_each_hash_n).
+#[inline(always)]
+pub fn extend_from_canonical_n<const N: usize>(base: u64, k: u32, hashes: &mut [u64; N]) {
+    if N == 0 {
+        return;
+    }
+    hashes[0] = base;
+    if N == 1 {
+        return;
+    }
+    let seed = (k as u64).wrapping_mul(MULTISEED);
     for (i, slot) in hashes.iter_mut().enumerate().skip(1) {
         let mut h = base.wrapping_mul((i as u64) ^ seed);
         h ^= h >> MULTISHIFT;
@@ -105,6 +136,26 @@ mod tests {
         let mut out: [u64; 0] = [];
         extend_hashes(123, 456, 7, &mut out);
         // no panic, no change
+    }
+
+    /// The const-sized form must agree with the slice form element for element.
+    #[test]
+    fn const_sized_matches_slice_form() {
+        const F: u64 = 0xFEED_FACE_CAFE_BEEF;
+        const R: u64 = 0x0BAD_C0DE_1337_D00D;
+        let base = canonical(F, R);
+        for k in [1u32, 21, 31] {
+            let mut want = [0u64; 8];
+            extend_hashes(F, R, k, &mut want);
+            let mut got = [0u64; 8];
+            extend_from_canonical_n::<8>(base, k, &mut got);
+            assert_eq!(got, want, "k={k}");
+
+            let mut one = [0u64; 1];
+            extend_from_canonical_n::<1>(base, k, &mut one);
+            assert_eq!(one[0], want[0]);
+            extend_from_canonical_n::<0>(base, k, &mut []);
+        }
     }
 
     #[test]

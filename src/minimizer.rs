@@ -25,77 +25,151 @@
 //! # Ok(()) }
 //! ```
 
-use crate::{kmer::NtHash, util::canonical, NtHashError, Result};
+use crate::{
+    kmer::{NtHash, NtHashIter},
+    util::canonical,
+    NtHashError, Result,
+};
 
 /// Monotonic ring-buffer deque of `(pos, hash)` candidates, hashes non-decreasing
 /// from front to back. The window holds at most `w` positions, plus one
-/// transient slot before the front is evicted, so a fixed `w + 1` capacity never
-/// overflows — no reallocation, no capacity checks, and index wrap-around by
-/// conditional subtraction (never a `%`) in the hot path.
+/// transient slot before the front is evicted, so `w + 1` slots always suffice.
+///
+/// The buffer is rounded up to a power of two and `head`/`tail` are *virtual*
+/// indices that only ever increase — wrapping is a single `&` on read. That
+/// removes both the conditional subtraction the obvious ring needs and, because
+/// `i & (len - 1)` is provably `< len`, the bounds check on every access; the
+/// pop loops touch the buffer once per candidate, so both were on the hot path.
 struct MonoWindow {
     buf: Box<[(usize, u64)]>,
+    /// `buf.len() - 1`; `buf.len()` is a power of two, so this is the wrap mask.
+    mask: usize,
     head: usize,
-    len: usize,
+    tail: usize,
 }
 
 impl MonoWindow {
     fn new(w: usize) -> Self {
+        let cap = (w + 1).next_power_of_two();
         Self {
-            buf: vec![(0usize, 0u64); w + 1].into_boxed_slice(),
+            buf: vec![(0usize, 0u64); cap].into_boxed_slice(),
+            mask: cap - 1,
             head: 0,
-            len: 0,
+            tail: 0,
         }
     }
 
     #[inline(always)]
     fn is_empty(&self) -> bool {
-        self.len == 0
+        self.head == self.tail
     }
 
     #[inline(always)]
     fn clear(&mut self) {
         self.head = 0;
-        self.len = 0;
+        self.tail = 0;
     }
 
     #[inline(always)]
     fn front(&self) -> (usize, u64) {
-        self.buf[self.head]
+        self.buf[self.head & self.mask]
     }
 
     #[inline(always)]
     fn back(&self) -> (usize, u64) {
-        let cap = self.buf.len();
-        let mut i = self.head + self.len - 1;
-        if i >= cap {
-            i -= cap;
-        }
-        self.buf[i]
+        self.buf[(self.tail - 1) & self.mask]
     }
 
     #[inline(always)]
     fn push_back(&mut self, x: (usize, u64)) {
-        let cap = self.buf.len();
-        let mut i = self.head + self.len;
-        if i >= cap {
-            i -= cap;
-        }
+        let i = self.tail & self.mask;
         self.buf[i] = x;
-        self.len += 1;
+        self.tail += 1;
     }
 
     #[inline(always)]
     fn pop_back(&mut self) {
-        self.len -= 1;
+        self.tail -= 1;
     }
 
     #[inline(always)]
     fn pop_front(&mut self) {
         self.head += 1;
-        if self.head == self.buf.len() {
-            self.head = 0;
+    }
+}
+
+/// Sentinel for "no position yet". Real positions are sequence indices, so
+/// `usize::MAX` can never collide; an `Option<usize>` here costs a tag load,
+/// test and store on every k-mer.
+const NO_POS: usize = usize::MAX;
+
+/// Sliding-window minimizer selection, independent of *how* k-mer hashes arrive.
+///
+/// Both drivers feed this the same `(pos, hash)` stream: the [`Iterator`] impl
+/// pulls one k-mer at a time, [`Minimizers::for_each`] pushes from the hasher's
+/// own hoisted roll loop.
+struct Scan {
+    w: usize,
+    /// Monotonic window; the front is the current window's minimizer.
+    window: MonoWindow,
+    /// Number of k-mers seen in the current gap-free run.
+    run_len: usize,
+    /// Position of the previously consumed k-mer, or [`NO_POS`].
+    prev_pos: usize,
+    /// Position of the last emitted minimizer, or [`NO_POS`].
+    last_emitted: usize,
+}
+
+impl Scan {
+    fn new(w: usize) -> Self {
+        Self {
+            w,
+            window: MonoWindow::new(w),
+            run_len: 0,
+            prev_pos: NO_POS,
+            last_emitted: NO_POS,
         }
-        self.len -= 1;
+    }
+
+    /// Consume one k-mer, returning the minimizer it completes, if any.
+    #[inline(always)]
+    fn push(&mut self, pos: usize, hash: u64) -> Option<Minimizer> {
+        // An `N`-skip makes positions non-contiguous; reset the window so a
+        // minimizer never spans an ambiguous base.
+        if self.prev_pos != NO_POS && pos != self.prev_pos + 1 {
+            self.window.clear();
+            self.run_len = 0;
+            self.last_emitted = NO_POS;
+        }
+        self.prev_pos = pos;
+
+        // Maintain the monotonic deque. Pop strictly-greater tails so that,
+        // on ties, the leftmost (earliest) k-mer is retained as minimizer.
+        while !self.window.is_empty() && self.window.back().1 > hash {
+            self.window.pop_back();
+        }
+        self.window.push_back((pos, hash));
+        self.run_len += 1;
+
+        // Evict the front once it falls outside the window of the last `w`
+        // k-mer positions (`front_pos <= pos - w`).
+        while self.window.front().0 + self.w <= pos {
+            self.window.pop_front();
+        }
+
+        // Emit the window minimizer once a full window exists, skipping
+        // repeats of the same occurrence.
+        if self.run_len >= self.w {
+            let (mpos, mhash) = self.window.front();
+            if self.last_emitted != mpos {
+                self.last_emitted = mpos;
+                return Some(Minimizer {
+                    pos: mpos,
+                    hash: mhash,
+                });
+            }
+        }
+        None
     }
 }
 
@@ -147,11 +221,7 @@ impl<'a> MinimizerBuilder<'a> {
         let hasher = NtHash::new(self.seq, self.k, 1, 0)?;
         Ok(Minimizers {
             hasher,
-            w: self.w,
-            window: MonoWindow::new(self.w),
-            run_len: 0,
-            prev_pos: None,
-            last_emitted: None,
+            scan: Scan::new(self.w),
         })
     }
 }
@@ -161,30 +231,28 @@ impl<'a> MinimizerBuilder<'a> {
 /// Each item is a small `Copy` value, so iteration allocates nothing.
 pub struct Minimizers<'a> {
     hasher: NtHash<'a>,
-    w: usize,
-    /// Monotonic window; the front is the current window's minimizer.
-    window: MonoWindow,
-    /// Number of k-mers seen in the current gap-free run.
-    run_len: usize,
-    /// Position of the previously consumed k-mer, for gap detection.
-    prev_pos: Option<usize>,
-    /// Position of the last emitted minimizer, for deduplication.
-    last_emitted: Option<usize>,
+    scan: Scan,
 }
 
-impl Minimizers<'_> {
-    /// Drive the scan to completion, invoking `f` for each selected minimizer in
-    /// a single tight loop — no per-item `Iterator::next` boundary. Equivalent
-    /// to `for m in self { f(m) }` but measurably faster on long sequences.
+impl<'a> Minimizers<'a> {
+    /// Drive the scan to completion, invoking `f` for each selected minimizer.
+    ///
+    /// Faster than iterating: it hands the k-mer stream to
+    /// [`NtHashIter::for_each_canonical`], whose loop keeps the rolling hash
+    /// state in registers, rather than pulling one k-mer at a time through
+    /// `&mut self` — which forces every field back to memory on each step.
     #[inline]
-    pub fn for_each<F: FnMut(Minimizer)>(mut self, mut f: F) {
-        while let Some(m) = self.step() {
-            f(m);
-        }
+    pub fn for_each<F: FnMut(Minimizer)>(self, mut f: F) {
+        let Minimizers { hasher, mut scan } = self;
+        NtHashIter::from_hasher(hasher).for_each_canonical(|pos, hash| {
+            if let Some(m) = scan.push(pos, hash) {
+                f(m);
+            }
+        });
     }
 
     /// Advance until the next minimizer is emitted (or the sequence ends).
-    /// Shared by [`for_each`](Self::for_each) and the [`Iterator`] impl.
+    /// Backs the [`Iterator`] impl.
     #[inline(always)]
     fn step(&mut self) -> Option<Minimizer> {
         loop {
@@ -195,41 +263,8 @@ impl Minimizers<'_> {
             }
             let pos = self.hasher.pos();
             let hash = canonical(self.hasher.forward_hash(), self.hasher.reverse_hash());
-
-            // An `N`-skip makes positions non-contiguous; reset the window so a
-            // minimizer never spans an ambiguous base.
-            if self.prev_pos.is_some_and(|pp| pos != pp + 1) {
-                self.window.clear();
-                self.run_len = 0;
-                self.last_emitted = None;
-            }
-            self.prev_pos = Some(pos);
-
-            // Maintain the monotonic deque. Pop strictly-greater tails so that,
-            // on ties, the leftmost (earliest) k-mer is retained as minimizer.
-            while !self.window.is_empty() && self.window.back().1 > hash {
-                self.window.pop_back();
-            }
-            self.window.push_back((pos, hash));
-            self.run_len += 1;
-
-            // Evict the front once it falls outside the window of the last `w`
-            // k-mer positions (`front_pos <= pos - w`).
-            while self.window.front().0 + self.w <= pos {
-                self.window.pop_front();
-            }
-
-            // Emit the window minimizer once a full window exists, skipping
-            // repeats of the same occurrence.
-            if self.run_len >= self.w {
-                let (mpos, mhash) = self.window.front();
-                if self.last_emitted != Some(mpos) {
-                    self.last_emitted = Some(mpos);
-                    return Some(Minimizer {
-                        pos: mpos,
-                        hash: mhash,
-                    });
-                }
+            if let Some(m) = self.scan.push(pos, hash) {
+                return Some(m);
             }
         }
     }
@@ -304,6 +339,36 @@ mod tests {
             assert!(
                 m.hash <= min_around || hashes.iter().any(|(p, h)| *p == m.pos && *h == m.hash)
             );
+        }
+    }
+
+    /// The push-based `for_each` driver and the pull-based `Iterator` must
+    /// select exactly the same minimizers, including across `N`-skips.
+    #[test]
+    fn for_each_matches_iterator() {
+        let seqs: [&[u8]; 4] = [
+            b"TACGGATCCGATTACGA",
+            b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT",
+            b"ACGTNNNNACGTACGTNACGGATTACAGGGCCCTTTAAA",
+            b"NNNNNNNN",
+        ];
+        for seq in seqs {
+            for k in [1u16, 3, 5, 8] {
+                for w in [1usize, 2, 5, 11] {
+                    let Ok(it) = MinimizerBuilder::new(seq).k(k).w(w).finish() else {
+                        continue;
+                    };
+                    let pulled: Vec<Minimizer> = it.collect();
+                    let mut pushed = Vec::new();
+                    MinimizerBuilder::new(seq)
+                        .k(k)
+                        .w(w)
+                        .finish()
+                        .unwrap()
+                        .for_each(|m| pushed.push(m));
+                    assert_eq!(pulled, pushed, "k={k} w={w} seq={seq:?}");
+                }
+            }
         }
     }
 

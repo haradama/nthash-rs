@@ -319,8 +319,9 @@ proptest! {
         prop_assert_eq!(fwd, rev);
     }
 
-    /// The batch read hasher (AVX2 where available) is bit-identical to
-    /// per-read `BlindNtHash`, across full lane groups and the scalar tail.
+    /// The batch read hasher (whichever SIMD backend the CPU selects) is
+    /// bit-identical to per-read `BlindNtHash`, across full lane groups and
+    /// the scalar tail.
     #[test]
     fn batch_matches_blind(
         (len, nreads) in (1usize..40, 1usize..10),

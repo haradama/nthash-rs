@@ -3,9 +3,16 @@
 //! An idiomatic, pure‑Rust port of the classic *ntHash* rolling‑hash suite,
 //! focused on contiguous k‑mer hashing for DNA sequences.
 //!
-//! This crate currently provides:
+//! This crate provides:
 //! - [`kmer::NtHash`]: the canonical contiguous‑k‑mer hasher that skips over
 //!   non‑ACGT bases (`N` or other characters).
+//! - [`blind::BlindNtHash`]: streaming hasher over a pre‑cleaned window.
+//! - [`seed::SeedNtHash`]: spaced‑seed hashing.
+//! - [`minimizer::Minimizers`]: canonical (w, k)-minimizers.
+//! - [`wide`] and [`batch`]: **SIMD** backends that roll several independent
+//!   chains at once — disjoint ranges of one sequence, or one read per lane.
+//!   Both assume N‑free input and are bit‑identical to the scalar path.
+//! - [`parallel`] (feature `parallel`): the same kernels spread across cores.
 //!
 //! All heavy bit‑twiddling is delegated to low‑level modules (`tables` and
 //! `constants`), which mirror the original C++ reference implementation, and
@@ -41,6 +48,8 @@
 /// Low‑level random seeds, split‑rotate tables, and numeric constants.
 // Not re‑exported directly.
 mod constants;
+#[cfg(target_arch = "x86_64")]
+mod simd;
 mod tables;
 
 /// Batch canonical hashing of many equal-length reads, with an AVX2 backend.
@@ -51,8 +60,13 @@ pub mod blind;
 pub mod kmer;
 /// Canonical (w, k)-minimizers built on the contiguous rolling hasher.
 pub mod minimizer;
+/// Multi-core canonical hashing of a single sequence (feature `parallel`).
+#[cfg(feature = "parallel")]
+pub mod parallel;
 pub mod seed;
 pub mod util;
+/// Lane-parallel (SIMD) canonical hashing of a single long sequence.
+pub mod wide;
 
 // --------------------------------------------------------------------------
 // Re‑exports: public API surface
@@ -69,6 +83,8 @@ pub use tables::sror;
 pub use util::canonical;
 /// Derive multiple hash values from a single canonical hash.
 pub use util::extend_hashes;
+/// Derive multiple hash values from an already-combined canonical hash.
+pub use util::{extend_from_canonical, extend_from_canonical_n};
 
 /// Primary rolling k‑mer hasher.
 ///
@@ -87,6 +103,8 @@ pub use minimizer::MinimizerBuilder;
 pub use minimizer::Minimizers;
 
 pub use batch::ReadHasher;
+
+pub use wide::{hash_canonical, hash_canonical_into};
 
 // --------------------------------------------------------------------------
 // Crate‑wide result and error types

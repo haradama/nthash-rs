@@ -60,6 +60,41 @@ while h.roll() {
 }
 ```
 
+## Fast paths
+
+The rolling hash is serial by construction, so a single chain is bound by the
+`srol` dependency latency. Where the workload allows independent chains, this
+crate rolls several at once in SIMD lanes (AVX-512F / AVX2 on `x86_64`, NEON on
+`aarch64`, detected at run time; all backends are bit-identical to the scalar
+one).
+
+```rust
+use nthash_rs::{wide, NtHashError, ReadHasher};
+
+fn main() -> Result<(), NtHashError> {
+    let seq = b"ACGTACGTACGTACGTACGTACGT";
+
+    // One long sequence, split across lanes. Unordered is the fastest form —
+    // use it when the consumer folds (a sketch, a Bloom filter, a counter).
+    let mut xor = 0u64;
+    wide::for_each_canonical_unordered(seq, 4, |_pos, hash| xor ^= hash)?;
+
+    // Or materialise in position order: `out[i]` is the k-mer starting at `i`.
+    let out = wide::hash_canonical(seq, 4)?;
+    assert_eq!(out.len(), seq.len() - 4 + 1);
+
+    // Many equal-length reads: one read per lane.
+    let reads: &[&[u8]] = &[b"ACGTACGT", b"TTGGCCAA", b"GATTACAG", b"CCGGTTAA"];
+    ReadHasher::new(4)?.hash_reads(reads, |_read, _pos, _hash| {})?;
+
+    Ok(())
+}
+```
+
+Both assume **N-free A/C/G/T** input; use `NtHash` when the sequence may contain
+ambiguous bases. With the `parallel` feature, `parallel::par_hash_canonical`
+spreads the same kernels across cores.
+
 ## License
 
 This project is MIT‑licensed (see [LICENSE](LICENSE)).

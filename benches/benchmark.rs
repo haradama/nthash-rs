@@ -79,6 +79,46 @@ fn bench_nthash_luizirber(c: &mut Criterion) {
     group.finish();
 }
 
+/// The lane-parallel backend over the same single sequence: eight disjoint
+/// k-mer ranges rolled at once in SIMD lanes. Unordered is the form a folding
+/// consumer (sketch, Bloom filter, counter) can use.
+fn bench_wide(c: &mut Criterion) {
+    let seq = generate_dna(1_000_000);
+    let k: u16 = 31;
+
+    let mut group = c.benchmark_group("nthash_vs_others");
+    group.throughput(Throughput::Bytes(seq.len() as u64));
+
+    group.bench_with_input(
+        BenchmarkId::new("wide(unordered)", seq.len()),
+        &seq,
+        |b, seq| {
+            b.iter(|| {
+                let mut acc = 0u64;
+                nthash_rs::wide::for_each_canonical_unordered(seq.as_bytes(), k, |_pos, hash| {
+                    acc ^= hash;
+                })
+                .unwrap();
+                black_box(acc);
+            })
+        },
+    );
+
+    let mut out = Vec::new();
+    group.bench_with_input(
+        BenchmarkId::new("wide(ordered)", seq.len()),
+        &seq,
+        |b, seq| {
+            b.iter(|| {
+                nthash_rs::wide::hash_canonical_into(seq.as_bytes(), k, &mut out).unwrap();
+                black_box(&out);
+            })
+        },
+    );
+
+    group.finish();
+}
+
 fn bench_blindnthash(c: &mut Criterion) {
     let seq = generate_dna(1_000_000);
     let k: u16 = 31;
@@ -227,6 +267,7 @@ criterion_group!(
     bench_nthash,
     bench_nthash_luizirber,
     bench_blindnthash,
+    bench_wide,
     bench_seednthash,
     bench_xxh3,
     bench_fnv,
