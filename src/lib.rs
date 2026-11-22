@@ -1,58 +1,65 @@
 //! # ntHash‑rs
 //!
-//! An idiomatic, pure‑Rust port of the classic *ntHash* rolling‑hash suite,
-//! focused on contiguous k‑mer hashing for DNA sequences.
+//! An idiomatic, pure‑Rust port of the *ntHash* rolling‑hash suite for DNA
+//! sequences, bit‑compatible with the C++ reference.
 //!
-//! This crate currently provides:
-//! - [`kmer::NtHash`]: the canonical contiguous‑k‑mer hasher that skips over
-//!   non‑ACGT bases (`N` or other characters).
+//! | Type | Use it for |
+//! |---|---|
+//! | [`NtHash`] / [`NtHashBuilder`] | contiguous k‑mers; windows containing `N` (or any other non‑ACGTU byte) are skipped |
+//! | [`BlindNtHash`] / [`BlindNtHashBuilder`] | streaming over pre‑cleaned input, the caller feeds each base |
+//! | [`SeedNtHash`] / [`SeedNtHashBuilder`] / [`SpacedSeeds`] | spaced seeds (one or more `0`/`1` masks) |
+//! | [`MinimizerBuilder`] / [`Minimizers`] | canonical (w, k)-minimizers |
+//! | [`ReadHasher`] | many N‑free reads with one reusable hasher |
 //!
-//! All heavy bit‑twiddling is delegated to low‑level modules (`tables` and
-//! `constants`), which mirror the original C++ reference implementation, and
-//! helper functionality in `util` for canonicalization and hash extension.
+//! All heavy bit‑twiddling is delegated to the low‑level `tables` and
+//! `constants` modules, which mirror the reference implementation, with
+//! [`util`] providing canonicalization and hash extension.
 //!
 //! ## Example
 //!
 //! ```rust
-//! use nthash_rs::{NtHash, Result};
+//! use nthash_rs::{NtHash, NtHashBuilder, Result};
 //!
 //! fn main() -> Result<()> {
-//!     // Create a new NtHash over "ACGTNACGT", k=4, emit 2 hashes per k‑mer, start at pos=0
+//!     // Low-level: roll by hand. k=4, two hashes per k‑mer, start at pos=0.
 //!     let mut hasher = NtHash::new(b"ACGTNACGT", 4, 2, 0)?;
-//!
-//!     // First call to roll() initializes and returns true if a valid k‑mer was found
-//!     assert!(hasher.roll());
-//!     // Retrieve the two hash values for the first valid 4‑mer
-//!     let hashes = hasher.hashes();
-//!     println!("First k‑mer hashes: {:#x}, {:#x}", hashes[0], hashes[1]);
-//!
-//!     // Advance through the sequence
+//!     // Each roll() moves to the next valid k‑mer (the first call finds the
+//!     // first one) and returns false at the end of the sequence.
 //!     while hasher.roll() {
-//!         let h = hasher.hashes()[0];
-//!         println!("Next k‑mer forward hash: {:#x}", h);
+//!         let hashes = hasher.hashes();
+//!         println!("{}: {:#x}, {:#x}", hasher.pos(), hashes[0], hashes[1]);
+//!     }
+//!
+//!     // High-level: one canonical hash per k‑mer, no allocation.
+//!     for (pos, hash) in NtHashBuilder::new(b"ACGTNACGT").k(4).finish()?.canonical() {
+//!         println!("{pos}: {hash:#x}");
 //!     }
 //!     Ok(())
 //! }
 //! ```
-
-// Uncomment to build with `no_std` support
-// #![cfg_attr(not(feature = "std"), no_std)]
 
 /// Low‑level random seeds, split‑rotate tables, and numeric constants.
 // Not re‑exported directly.
 mod constants;
 mod tables;
 
-/// Batch canonical hashing of many equal-length reads, with an AVX2 backend.
+/// Batch canonical hashing of many reads with one reusable hasher.
 pub mod batch;
+/// Streaming hasher over pre‑cleaned input, rolled one caller‑fed base at a time.
 pub mod blind;
 /// High‑level contiguous k‑mer rolling hasher.
 /// Skips over non‑ACGT bases exactly as the original reference.
 pub mod kmer;
 /// Canonical (w, k)-minimizers built on the contiguous rolling hasher.
 pub mod minimizer;
+/// Spaced‑seed hasher for non‑contiguous k‑mers.
 pub mod seed;
 pub mod util;
+
+// README examples are compiled and run as doctests so they cannot rot.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 // --------------------------------------------------------------------------
 // Re‑exports: public API surface
@@ -75,12 +82,17 @@ pub use util::extend_hashes;
 /// See [`kmer::NtHash`] for full documentation.
 pub use kmer::NtHash;
 pub use kmer::NtHashBuilder;
+pub use kmer::NtHashCanonicalIter;
+pub use kmer::NtHashIter;
 
 pub use blind::BlindNtHash;
 pub use blind::BlindNtHashBuilder;
+pub use blind::BlindNtHashCanonicalIter;
+pub use blind::BlindNtHashIter;
 
 pub use seed::SeedNtHash;
 pub use seed::SeedNtHashBuilder;
+pub use seed::SpacedSeeds;
 
 pub use minimizer::Minimizer;
 pub use minimizer::MinimizerBuilder;
@@ -97,8 +109,9 @@ pub type Result<T, E = NtHashError> = std::result::Result<T, E>;
 
 /// Errors common to all ntHash k‑mer hashers.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NtHashError {
-    /// `k` was zero.
+    /// `k` was zero (or disagreed with the `k` of precompiled seeds).
     #[error("k must be > 0")]
     InvalidK,
 
@@ -106,23 +119,25 @@ pub enum NtHashError {
     #[error("w must be > 0")]
     InvalidW,
 
-    /// Batch read hashing requires every read to have the same length.
-    #[error("reads must all have the same length ({expected}), found {found}")]
-    UnequalReadLengths { expected: usize, found: usize },
-
     /// Provided sequence length is shorter than `k`.
     #[error("sequence length ({seq_len}) < k ({k})")]
     SequenceTooShort { seq_len: usize, k: u16 },
 
     /// Starting `pos` is beyond the last valid window (`seq.len() - k`).
-    #[error("position ({pos}) exceeds sequence length ({seq_len})")]
+    #[error("position ({pos}) exceeds the last k-mer start of a sequence of length {seq_len}")]
     PositionOutOfRange { pos: usize, seq_len: usize },
 
-    #[error("invalid sequence")]
-    InvalidSequence,
+    /// A spaced-seed mask is not exactly `k` characters long.
+    #[error("spaced-seed mask length ({mask_len}) != k ({k})")]
+    InvalidMaskLength { mask_len: usize, k: u16 },
 
-    #[error("invalid window offsets")]
-    InvalidWindowOffsets,
+    /// A spaced-seed mask contains a character other than `'0'` or `'1'`.
+    #[error("spaced-seed mask may only contain '0' and '1'")]
+    InvalidMask,
+
+    /// A spaced-seed care index does not fall inside the k‑mer.
+    #[error("care index ({index}) must be < k ({k})")]
+    InvalidCareIndex { index: usize, k: u16 },
 }
 
 // --------------------------------------------------------------------------

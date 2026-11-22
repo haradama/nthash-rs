@@ -25,13 +25,16 @@
 //! # Ok(()) }
 //! ```
 
-use crate::{kmer::NtHash, util::canonical, NtHashError, Result};
+use crate::{
+    kmer::{NtHashBuilder, NtHashCanonicalIter},
+    NtHashError, Result,
+};
 
 /// Monotonic ring-buffer deque of `(pos, hash)` candidates, hashes non-decreasing
 /// from front to back. The window holds at most `w` positions, plus one
-/// transient slot before the front is evicted, so a fixed `w + 1` capacity never
-/// overflows — no reallocation, no capacity checks, and index wrap-around by
-/// conditional subtraction (never a `%`) in the hot path.
+/// transient slot before the front is evicted, so a fixed `cap + 1` capacity
+/// never overflows — no reallocation, no capacity checks, and index wrap-around
+/// by conditional subtraction (never a `%`) in the hot path.
 struct MonoWindow {
     buf: Box<[(usize, u64)]>,
     head: usize,
@@ -39,9 +42,10 @@ struct MonoWindow {
 }
 
 impl MonoWindow {
-    fn new(w: usize) -> Self {
+    /// `cap` is the largest number of candidates the window can hold at once.
+    fn new(cap: usize) -> Self {
         Self {
-            buf: vec![(0usize, 0u64); w + 1].into_boxed_slice(),
+            buf: vec![(0usize, 0u64); cap + 1].into_boxed_slice(),
             head: 0,
             len: 0,
         }
@@ -143,12 +147,16 @@ impl<'a> MinimizerBuilder<'a> {
         if self.w == 0 {
             return Err(NtHashError::InvalidW);
         }
-        // `num_hashes = 1` makes `hashes()[0]` the canonical hash.
-        let hasher = NtHash::new(self.seq, self.k, 1, 0)?;
+        // One canonical hash per k-mer, with `N`-containing k-mers skipped.
+        let hashes = NtHashBuilder::new(self.seq).k(self.k).finish()?.canonical();
+        // The deque holds distinct k-mer positions, so it never needs more slots
+        // than the sequence has k-mers — which keeps an oversized `w` from
+        // turning into an oversized (or overflowing) allocation.
+        let num_kmers = self.seq.len() - self.k as usize + 1;
         Ok(Minimizers {
-            hasher,
+            hashes,
             w: self.w,
-            window: MonoWindow::new(self.w),
+            window: MonoWindow::new(self.w.min(num_kmers)),
             run_len: 0,
             prev_pos: None,
             last_emitted: None,
@@ -160,7 +168,8 @@ impl<'a> MinimizerBuilder<'a> {
 ///
 /// Each item is a small `Copy` value, so iteration allocates nothing.
 pub struct Minimizers<'a> {
-    hasher: NtHash<'a>,
+    /// Canonical hash of every valid k-mer, in order.
+    hashes: NtHashCanonicalIter<'a>,
     w: usize,
     /// Monotonic window; the front is the current window's minimizer.
     window: MonoWindow,
@@ -188,13 +197,7 @@ impl Minimizers<'_> {
     #[inline(always)]
     fn step(&mut self) -> Option<Minimizer> {
         loop {
-            // `advance` rolls the forward/reverse state with N-skip but skips the
-            // per-k-mer hash-buffer materialization we don't need here.
-            if !self.hasher.advance() {
-                return None;
-            }
-            let pos = self.hasher.pos();
-            let hash = canonical(self.hasher.forward_hash(), self.hasher.reverse_hash());
+            let (pos, hash) = self.hashes.next()?;
 
             // An `N`-skip makes positions non-contiguous; reset the window so a
             // minimizer never spans an ambiguous base.
@@ -214,8 +217,9 @@ impl Minimizers<'_> {
             self.run_len += 1;
 
             // Evict the front once it falls outside the window of the last `w`
-            // k-mer positions (`front_pos <= pos - w`).
-            while self.window.front().0 + self.w <= pos {
+            // k-mer positions (`pos - front_pos >= w`; the front never exceeds
+            // `pos`, and this form cannot overflow for a huge `w`).
+            while pos - self.window.front().0 >= self.w {
                 self.window.pop_front();
             }
 
@@ -241,16 +245,6 @@ impl Iterator for Minimizers<'_> {
     #[inline]
     fn next(&mut self) -> Option<Minimizer> {
         self.step()
-    }
-}
-
-impl<'a> IntoIterator for MinimizerBuilder<'a> {
-    type Item = Minimizer;
-    type IntoIter = Minimizers<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.finish()
-            .expect("invalid MinimizerBuilder configuration")
     }
 }
 
@@ -284,26 +278,44 @@ mod tests {
     fn each_minimizer_is_the_window_minimum() {
         let seq = b"TACGGATCCGATTACGA";
         let (k, w) = (5u16, 4usize);
-        let hashes: Vec<(usize, u64)> = NtHashBuilder::new(seq)
+        let hashes: Vec<u64> = NtHashBuilder::new(seq)
             .k(k)
             .num_hashes(1)
             .finish()
             .unwrap()
-            .map(|(p, h)| (p, h[0]))
+            .map(|(_, h)| h[0])
             .collect();
-        for m in MinimizerBuilder::new(seq).k(k).w(w).finish().unwrap() {
-            // The emitted hash must be the min over the w k-mers ending at, or
-            // starting at, the minimizer's window — check it is <= every k-mer
-            // within `w` positions of it.
-            let min_around = hashes
-                .iter()
-                .filter(|(p, _)| m.pos.abs_diff(*p) < w)
-                .map(|(_, h)| *h)
-                .min()
-                .unwrap();
-            assert!(
-                m.hash <= min_around || hashes.iter().any(|(p, h)| *p == m.pos && *h == m.hash)
-            );
+        // Leftmost minimum of every window of `w` consecutive k-mers, deduplicated.
+        let mut expected: Vec<(usize, u64)> = Vec::new();
+        for (start, win) in hashes.windows(w).enumerate() {
+            let min = *win.iter().min().unwrap();
+            let off = win.iter().position(|&h| h == min).unwrap();
+            if expected.last() != Some(&(start + off, min)) {
+                expected.push((start + off, min));
+            }
+        }
+        let got: Vec<(usize, u64)> = MinimizerBuilder::new(seq)
+            .k(k)
+            .w(w)
+            .finish()
+            .unwrap()
+            .map(|m| (m.pos, m.hash))
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    /// A window far larger than the sequence must neither overflow nor try to
+    /// allocate `w` slots; with fewer than `w` k-mers nothing is selected.
+    #[test]
+    fn oversized_window_is_harmless() {
+        for w in [usize::MAX, usize::MAX - 1, 1 << 45] {
+            let n = MinimizerBuilder::new(b"ACGTACGTACGT")
+                .k(4)
+                .w(w)
+                .finish()
+                .unwrap()
+                .count();
+            assert_eq!(n, 0, "w={w}");
         }
     }
 

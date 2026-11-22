@@ -809,13 +809,55 @@ const fn build_seed_tab() -> [u64; ASCII_SIZE] {
     t[b'g' as usize] = SEED_G;
     t[b'T' as usize] = SEED_T;
     t[b't' as usize] = SEED_T;
+    // RNA U/u → T, as in the reference and in every other table here
+    t[b'U' as usize] = SEED_T;
+    t[b'u' as usize] = SEED_T;
     // Also fill in for ASCII & CP_OFF (complements)
     t[1] = SEED_T; // 'A' & 7 = 1 → T
     t[3] = SEED_G; // 'C' & 7 = 3 → G
     t[4] = SEED_A; // 'T' & 7 = 4 → A
+    t[5] = SEED_A; // 'U' & 7 = 5 → A  (RNA support)
     t[7] = SEED_C; // 'G' & 7 = 7 → C
     t
 }
 
 /// ASCII → 64‑bit seed lookup table (A/C/G/T/N).
 pub const SEED_TAB: [u64; ASCII_SIZE] = build_seed_tab();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every byte-indexed table must agree on which bytes are bases, exactly as
+    /// in the C++ reference (`src/internal.hpp`): A/C/G/T/U in either case, plus
+    /// the `byte & CP_OFF` complement indices 1, 3, 4, 5, 7. A byte that is a
+    /// base in one table and `N` in another makes rolling disagree with
+    /// recomputation.
+    #[test]
+    fn tables_agree_on_the_base_alphabet() {
+        let bases = b"ACGTUacgtu";
+        let complement_indices: Vec<u8> = bases.iter().map(|b| b & CP_OFF).collect();
+        for c in 0..=255u8 {
+            let i = c as usize;
+            let is_base = bases.contains(&c);
+            let hashed = is_base || complement_indices.contains(&c);
+            assert_eq!(SEED_TAB[i] != SEED_N, hashed, "SEED_TAB[{c}]");
+            assert_eq!(MS_TAB_31L[i] != &N31L, hashed, "MS_TAB_31L[{c}]");
+            assert_eq!(MS_TAB_33R[i] != &N33R, hashed, "MS_TAB_33R[{c}]");
+            assert_eq!(CONVERT_TAB[i] != 255, is_base, "CONVERT_TAB[{c}]");
+            assert_eq!(RC_CONVERT_TAB[i] != 255, is_base, "RC_CONVERT_TAB[{c}]");
+            // The zero-rotation entry of the split-rotate tables is the seed.
+            assert_eq!(MS_TAB_31L[i][0] | MS_TAB_33R[i][0], SEED_TAB[i], "byte {c}");
+        }
+        // U is T throughout.
+        for (u, t) in [(b'U', b'T'), (b'u', b't')] {
+            assert_eq!(SEED_TAB[u as usize], SEED_TAB[t as usize]);
+            assert_eq!(
+                SEED_TAB[(u & CP_OFF) as usize],
+                SEED_TAB[(t & CP_OFF) as usize]
+            );
+            assert_eq!(CONVERT_TAB[u as usize], CONVERT_TAB[t as usize]);
+            assert_eq!(RC_CONVERT_TAB[u as usize], RC_CONVERT_TAB[t as usize]);
+        }
+    }
+}

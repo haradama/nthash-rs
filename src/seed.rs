@@ -1,10 +1,18 @@
-//! **Streaming spaced-seed ntHash** for *non-contiguous* k‑mers.
+//! **Spaced-seed ntHash** for *non-contiguous* k‑mers.
 //!
 //! **`SeedNtHash` computes hashes using spaced seeds**, where only selected
-//! positions in the k‑mer are considered (“care sites”).
+//! positions in the k‑mer are considered (“care sites”). Several seeds can be
+//! hashed at once, each yielding `num_hashes` values per window.
 //!
-//! Hashes are re‑computed per window rather than rolled, allowing support
-//! for multiple seeds and arbitrary binary masks.
+//! Windows are **rolled**, not recomputed: sliding by one base only changes the
+//! care membership at the *run boundaries* of the mask, so the per-window cost
+//! is O(#care-runs). Seeds whose mask is too scattered for that to pay off fall
+//! back to an O(#care) recompute, chosen per seed.
+//!
+//! The per-seed lookup tables depend only on the masks and `k`, never on the
+//! sequence. They live in [`SpacedSeeds`], which can be built once and shared
+//! by any number of hashers via [`SeedNtHash::with_seeds`] — the right shape
+//! when hashing many short reads with the same seeds.
 //!
 //! Bit-level operations are delegated to `tables`, `constants`, and
 //! `util::extend_hashes` for efficient hash computation.
@@ -24,12 +32,15 @@ use crate::{
 ///
 /// # Errors
 /// Returns an error if the mask length does not match `k`, or contains characters other than '0' or '1'.
-fn parse_seed_string(mask: &str, k: usize) -> Result<Vec<usize>> {
-    if mask.len() != k {
-        return Err(NtHashError::InvalidK);
+fn parse_seed_string(mask: &str, k: u16) -> Result<Vec<usize>> {
+    if mask.len() != k as usize {
+        return Err(NtHashError::InvalidMaskLength {
+            mask_len: mask.len(),
+            k,
+        });
     }
     if !mask.bytes().all(|b| b == b'0' || b == b'1') {
-        return Err(NtHashError::InvalidSequence);
+        return Err(NtHashError::InvalidMask);
     }
     Ok(mask
         .bytes()
@@ -49,13 +60,14 @@ struct BoundaryTab {
 /// recompute a window from scratch and *roll* between windows.
 ///
 /// - `rot` — flattened `care.len() × 256` table `[fwd, rev]` for recomputing a
-///   window (used at init and after every roll would be too slow — it is the
-///   O(care) path).
+///   window from scratch (the O(#care) path, used at init and for seeds where
+///   rolling doesn't pay).
 /// - `left` / `right` — the **run boundaries** of the care pattern: the only
 ///   positions whose care-membership changes when the window slides by one.
 ///   Rolling is `srol(fwd)` / `sror(rev)` plus a correction at each boundary, so
 ///   the per-window cost is O(#runs) instead of O(#care).
 struct SeedTab {
+    /// Care positions, strictly increasing.
     care: Vec<usize>,
     rot: Vec<[u64; 2]>,
     left: Vec<BoundaryTab>,
@@ -80,7 +92,8 @@ fn boundary_tab(off: usize, d_fwd: u32, d_rev: u32) -> BoundaryTab {
     BoundaryTab { off, tab }
 }
 
-/// Precompute the recompute and roll tables for one seed's care positions.
+/// Precompute the recompute and roll tables for one seed's care positions,
+/// which must be strictly increasing and `< k`.
 fn build_seed_tab(care: Vec<usize>, k: usize) -> SeedTab {
     let mut rot = vec![[0u64; 2]; care.len() * 256];
     for (i, &p) in care.iter().enumerate() {
@@ -127,6 +140,172 @@ fn build_seed_tab(care: Vec<usize>, k: usize) -> SeedTab {
     }
 }
 
+impl SeedTab {
+    /// Compute the state for the window at `pos` from scratch — the O(#care)
+    /// path, used at init and for seeds where rolling doesn't pay.
+    #[inline]
+    fn recompute(&self, seq: &[u8], pos: usize) -> SeedState {
+        let mut fwd = 0u64;
+        let mut rev = 0u64;
+        let mut n_invalid = 0usize;
+        for (i, &p) in self.care.iter().enumerate() {
+            let c = seq[pos + p] as usize;
+            let e = self.rot[i * 256 + c];
+            fwd ^= e[0];
+            rev ^= e[1];
+            if SEED_TAB[c] == SEED_N {
+                n_invalid += 1;
+            }
+        }
+        SeedState {
+            fwd,
+            rev,
+            n_invalid,
+        }
+    }
+
+    /// Roll the state `s` of the window at `pos` to the window at `pos + 1`,
+    /// correcting only at the care pattern's run boundaries — the
+    /// O(#boundaries) path.
+    #[inline]
+    fn roll(&self, seq: &[u8], pos: usize, s: SeedState) -> SeedState {
+        let mut fwd = srol(s.fwd);
+        let mut rev = sror(s.rev);
+        let mut n_invalid = s.n_invalid;
+        // Bases leaving the care coverage.
+        for lb in &self.left {
+            let c = seq[pos + lb.off] as usize;
+            let e = lb.tab[c];
+            fwd ^= e[0];
+            rev ^= e[1];
+            if SEED_TAB[c] == SEED_N {
+                n_invalid -= 1;
+            }
+        }
+        // Bases entering the care coverage.
+        for rb in &self.right {
+            let c = seq[pos + 1 + rb.off] as usize;
+            let e = rb.tab[c];
+            fwd ^= e[0];
+            rev ^= e[1];
+            if SEED_TAB[c] == SEED_N {
+                n_invalid += 1;
+            }
+        }
+        SeedState {
+            fwd,
+            rev,
+            n_invalid,
+        }
+    }
+}
+
+/// A precompiled set of spaced seeds for a fixed `k`.
+///
+/// Building the per-seed lookup tables is by far the most expensive part of
+/// setting up a [`SeedNtHash`], and depends only on the masks — not on the
+/// sequence. Compile the seeds once and hand a reference to each hasher with
+/// [`SeedNtHash::with_seeds`] (or [`SeedNtHashBuilder::seeds`]) to hash many
+/// sequences without rebuilding them.
+///
+/// ```
+/// use nthash_rs::seed::{SeedNtHash, SpacedSeeds};
+/// # fn main() -> nthash_rs::Result<()> {
+/// let seeds = SpacedSeeds::from_masks(&["110011", "101101"], 6)?;
+/// for read in [&b"ACGTACGTAC"[..], &b"TTGACCATGA"[..]] {
+///     let mut h = SeedNtHash::with_seeds(read, &seeds, 1, 0)?;
+///     while h.roll() {
+///         let _ = (h.pos(), h.hashes());
+///     }
+/// }
+/// # Ok(()) }
+/// ```
+pub struct SpacedSeeds {
+    k: u16,
+    tabs: Vec<SeedTab>,
+}
+
+impl SpacedSeeds {
+    /// Compile seeds from mask strings of length `k`, where `'1'` marks a care
+    /// position and `'0'` a don't-care position.
+    ///
+    /// # Errors
+    /// [`NtHashError::InvalidK`] if `k == 0`,
+    /// [`NtHashError::InvalidMaskLength`] if a mask is not `k` characters long,
+    /// or [`NtHashError::InvalidMask`] if it contains anything but `'0'`/`'1'`.
+    pub fn from_masks<S: AsRef<str>>(masks: &[S], k: u16) -> Result<Self> {
+        if k == 0 {
+            return Err(NtHashError::InvalidK);
+        }
+        let tabs = masks
+            .iter()
+            .map(|m| parse_seed_string(m.as_ref(), k).map(|care| build_seed_tab(care, k as usize)))
+            .collect::<Result<_>>()?;
+        Ok(Self { k, tabs })
+    }
+
+    /// Compile seeds from pre-parsed care indices (one list per seed). The
+    /// order of the indices does not matter and duplicates are ignored.
+    ///
+    /// # Errors
+    /// [`NtHashError::InvalidK`] if `k == 0`, or
+    /// [`NtHashError::InvalidCareIndex`] if an index is `>= k`.
+    pub fn from_care_indices(seeds: Vec<Vec<usize>>, k: u16) -> Result<Self> {
+        if k == 0 {
+            return Err(NtHashError::InvalidK);
+        }
+        let tabs = seeds
+            .into_iter()
+            .map(|mut care| {
+                if let Some(&index) = care.iter().find(|&&i| i >= k as usize) {
+                    return Err(NtHashError::InvalidCareIndex { index, k });
+                }
+                // The tables assume a set of positions: a repeated index would
+                // be XOR-ed in twice and counted twice as an ambiguous base.
+                care.sort_unstable();
+                care.dedup();
+                Ok(build_seed_tab(care, k as usize))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { k, tabs })
+    }
+
+    /// The k‑mer span these seeds were compiled for.
+    #[inline]
+    pub fn k(&self) -> u16 {
+        self.k
+    }
+
+    /// Number of seeds.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.tabs.len()
+    }
+
+    /// Whether the set contains no seeds.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+}
+
+/// The seeds a hasher rolls with: compiled for this hasher alone, or borrowed
+/// from the caller so the tables are shared across hashers.
+enum SeedSet<'a> {
+    Owned(SpacedSeeds),
+    Shared(&'a SpacedSeeds),
+}
+
+impl SeedSet<'_> {
+    #[inline(always)]
+    fn tabs(&self) -> &[SeedTab] {
+        match self {
+            SeedSet::Owned(s) => &s.tabs,
+            SeedSet::Shared(s) => &s.tabs,
+        }
+    }
+}
+
 /// Rolling state for one seed: its forward/reverse hashes for the current
 /// window and how many of its care positions currently hold an ambiguous base.
 #[derive(Clone, Copy)]
@@ -139,28 +318,100 @@ struct SeedState {
 /// Rolling spaced-seed ntHash. Handles multiple seeds and multiple hashes per
 /// k-mer, advancing between windows in O(#care-runs) rather than recomputing.
 pub struct SeedNtHash<'a> {
-    seq: &'a [u8],          // Input nucleotide sequence
-    k: usize,               // k-mer size
-    num_hashes: usize,      // Number of hashes per seed
-    seeds: Vec<SeedTab>,    // Care indices + precomputed roll/recompute tables
-    state: Vec<SeedState>,  // Per-seed rolling hash state
-    pos: usize,             // Current position in the sequence
-    hashes: Vec<u64>,       // Hash results (flattened)
-    initialised: bool,      // Whether the hasher has found the first valid k-mer
+    /// Input nucleotide sequence.
+    seq: &'a [u8],
+    /// k-mer span.
+    k: usize,
+    /// Number of hashes per seed.
+    num_hashes: usize,
+    /// Care indices + precomputed roll/recompute tables.
+    seeds: SeedSet<'a>,
+    /// Per-seed rolling hash state.
+    state: Vec<SeedState>,
+    /// Current position in the sequence.
+    pos: usize,
+    /// Hash results, flattened as `seeds × num_hashes`.
+    hashes: Vec<u64>,
+    /// Whether the starting window has been evaluated yet.
+    initialized: bool,
 }
 
 impl<'a> SeedNtHash<'a> {
     /// Creates a new hasher from a sequence and spaced-seed masks.
     ///
+    /// The masks are compiled for this hasher alone; to hash many sequences
+    /// with the same seeds, compile them once with [`SpacedSeeds::from_masks`]
+    /// and use [`with_seeds`](Self::with_seeds).
+    ///
+    /// `num_hashes_per_seed` is clamped to at least 1.
+    ///
     /// # Errors
-    /// Returns an error if `k` is zero, the sequence is too short, or a mask is invalid.
-    pub fn new(
+    /// Returns an error if `k` is zero, the sequence is too short, `start_pos`
+    /// is out of range, or a mask is invalid.
+    pub fn new<S: AsRef<str>>(
         seq: &'a [u8],
-        seed_masks: &[String],
+        seed_masks: &[S],
         num_hashes_per_seed: usize,
         k: u16,
         start_pos: usize,
     ) -> Result<Self> {
+        Self::check_bounds(seq, k, start_pos)?;
+        let seeds = SpacedSeeds::from_masks(seed_masks, k)?;
+        Ok(Self::build(
+            seq,
+            SeedSet::Owned(seeds),
+            num_hashes_per_seed,
+            start_pos,
+        ))
+    }
+
+    /// Alternative constructor using pre-parsed care indices (skips mask
+    /// parsing). The order of the indices does not matter and duplicates are
+    /// ignored.
+    ///
+    /// # Errors
+    /// As [`new`](Self::new), with [`NtHashError::InvalidCareIndex`] for an
+    /// index `>= k`.
+    pub fn from_care_indices(
+        seq: &'a [u8],
+        seeds: Vec<Vec<usize>>,
+        num_hashes_per_seed: usize,
+        k: u16,
+        start_pos: usize,
+    ) -> Result<Self> {
+        Self::check_bounds(seq, k, start_pos)?;
+        let seeds = SpacedSeeds::from_care_indices(seeds, k)?;
+        Ok(Self::build(
+            seq,
+            SeedSet::Owned(seeds),
+            num_hashes_per_seed,
+            start_pos,
+        ))
+    }
+
+    /// Creates a hasher over `seq` that borrows precompiled `seeds`, skipping
+    /// the table construction [`new`](Self::new) performs on every call. The
+    /// k‑mer span is [`seeds.k()`](SpacedSeeds::k).
+    ///
+    /// # Errors
+    /// Returns an error if the sequence is shorter than `k` or `start_pos` is
+    /// out of range.
+    pub fn with_seeds(
+        seq: &'a [u8],
+        seeds: &'a SpacedSeeds,
+        num_hashes_per_seed: usize,
+        start_pos: usize,
+    ) -> Result<Self> {
+        Self::check_bounds(seq, seeds.k, start_pos)?;
+        Ok(Self::build(
+            seq,
+            SeedSet::Shared(seeds),
+            num_hashes_per_seed,
+            start_pos,
+        ))
+    }
+
+    fn check_bounds(seq: &[u8], k: u16, start_pos: usize) -> Result<()> {
         if k == 0 {
             return Err(NtHashError::InvalidK);
         }
@@ -177,61 +428,33 @@ impl<'a> SeedNtHash<'a> {
                 seq_len: seq.len(),
             });
         }
-
-        let mut seeds = Vec::with_capacity(seed_masks.len());
-        for m in seed_masks {
-            let care = parse_seed_string(m, k_usz)?;
-            seeds.push(build_seed_tab(care, k_usz));
-        }
-
-        let state = vec![
-            SeedState {
-                fwd: 0,
-                rev: 0,
-                n_invalid: 0,
-            };
-            seeds.len()
-        ];
-        Ok(Self {
-            seq,
-            k: k_usz,
-            num_hashes: num_hashes_per_seed.max(1),
-            seeds,
-            state,
-            pos: start_pos,
-            hashes: vec![0; seed_masks.len() * num_hashes_per_seed.max(1)],
-            initialised: false,
-        })
+        Ok(())
     }
 
-    /// Alternative constructor using pre-parsed care indices (skips mask parsing).
-    pub fn from_care_indices(
-        seq: &'a [u8],
-        seeds: Vec<Vec<usize>>,
-        num_hashes_per_seed: usize,
-        k: u16,
-        start_pos: usize,
-    ) -> Result<Self> {
-        let k_usz = k as usize;
-        if seeds.iter().any(|v| v.iter().any(|&i| i >= k_usz)) {
-            return Err(NtHashError::InvalidWindowOffsets);
-        }
-        Self::new(
+    /// Assemble a hasher from validated parts.
+    fn build(seq: &'a [u8], seeds: SeedSet<'a>, num_hashes: usize, pos: usize) -> Self {
+        let num_hashes = num_hashes.max(1);
+        let (num_seeds, k) = match &seeds {
+            SeedSet::Owned(s) => (s.len(), s.k),
+            SeedSet::Shared(s) => (s.len(), s.k),
+        };
+        Self {
             seq,
-            &vec![String::from_utf8(vec![b'0'; k_usz]).unwrap(); seeds.len()], // dummy masks
-            num_hashes_per_seed,
-            k,
-            start_pos,
-        )
-        .map(|mut s| {
-            // Replace the dummy (empty-care) seeds with the caller's care indices,
-            // rebuilding the precomputed rotation tables for each.
-            s.seeds = seeds
-                .into_iter()
-                .map(|care| build_seed_tab(care, k_usz))
-                .collect();
-            s
-        })
+            k: k as usize,
+            num_hashes,
+            seeds,
+            state: vec![
+                SeedState {
+                    fwd: 0,
+                    rev: 0,
+                    n_invalid: 0,
+                };
+                num_seeds
+            ],
+            pos,
+            hashes: vec![0; num_seeds * num_hashes],
+            initialized: false,
+        }
     }
 
     /// Returns the current position in the sequence.
@@ -240,7 +463,8 @@ impl<'a> SeedNtHash<'a> {
         self.pos
     }
 
-    /// Returns the current set of hash values.
+    /// Returns the current set of hash values, flattened seed by seed
+    /// (`num_hashes` values each).
     #[inline(always)]
     pub fn hashes(&self) -> &[u64] {
         &self.hashes
@@ -255,10 +479,13 @@ impl<'a> SeedNtHash<'a> {
     /// only when the end of the sequence is reached.
     pub fn roll(&mut self) -> bool {
         let last = self.seq.len() - self.k;
-        if !self.initialised {
-            self.initialised = true;
+        if !self.initialized {
+            self.initialized = true;
             // Recompute the state for the starting window, then emit it if valid.
-            self.compute_state_at(self.pos);
+            let tabs = self.seeds.tabs();
+            for (s, tab) in self.state.iter_mut().zip(tabs) {
+                *s = tab.recompute(self.seq, self.pos);
+            }
             if self.all_valid() {
                 self.emit();
                 return true;
@@ -281,90 +508,28 @@ impl<'a> SeedNtHash<'a> {
         self.state.iter().all(|s| s.n_invalid == 0)
     }
 
-    /// Recompute one seed's state from scratch for the window at `pos` — the
-    /// O(#care) path, used at init and for seeds where rolling doesn't pay.
-    fn recompute_seed(&mut self, si: usize, pos: usize) {
-        let st = &self.seeds[si];
-        let mut fwd = 0u64;
-        let mut rev = 0u64;
-        let mut n_invalid = 0usize;
-        for (i, &p) in st.care.iter().enumerate() {
-            let c = self.seq[pos + p] as usize;
-            let e = st.rot[i * 256 + c];
-            fwd ^= e[0];
-            rev ^= e[1];
-            if SEED_TAB[c] == SEED_N {
-                n_invalid += 1;
-            }
-        }
-        self.state[si] = SeedState {
-            fwd,
-            rev,
-            n_invalid,
-        };
-    }
-
-    /// Roll one seed's state from the window at `pos` to `pos + 1`, correcting
-    /// only at the care pattern's run boundaries — the O(#boundaries) path.
-    fn roll_seed(&mut self, si: usize, pos: usize) {
-        let st = &self.seeds[si];
-        let s = &mut self.state[si];
-        let mut fwd = srol(s.fwd);
-        let mut rev = sror(s.rev);
-        let mut n_invalid = s.n_invalid;
-        // Bases leaving the care coverage.
-        for lb in &st.left {
-            let c = self.seq[pos + lb.off] as usize;
-            let e = lb.tab[c];
-            fwd ^= e[0];
-            rev ^= e[1];
-            if SEED_TAB[c] == SEED_N {
-                n_invalid -= 1;
-            }
-        }
-        // Bases entering the care coverage.
-        for rb in &st.right {
-            let c = self.seq[pos + 1 + rb.off] as usize;
-            let e = rb.tab[c];
-            fwd ^= e[0];
-            rev ^= e[1];
-            if SEED_TAB[c] == SEED_N {
-                n_invalid += 1;
-            }
-        }
-        *s = SeedState {
-            fwd,
-            rev,
-            n_invalid,
-        };
-    }
-
-    /// Recompute every seed's state from scratch for the window at `pos`.
-    fn compute_state_at(&mut self, pos: usize) {
-        for si in 0..self.seeds.len() {
-            self.recompute_seed(si, pos);
-        }
-    }
-
     /// Advance every seed by one position, rolling or recomputing per seed.
     fn roll_step(&mut self) {
         let pos = self.pos;
-        for si in 0..self.seeds.len() {
-            if self.seeds[si].rollable {
-                self.roll_seed(si, pos);
+        let tabs = self.seeds.tabs();
+        for (s, tab) in self.state.iter_mut().zip(tabs) {
+            *s = if tab.rollable {
+                tab.roll(self.seq, pos, *s)
             } else {
-                self.recompute_seed(si, pos + 1);
-            }
+                tab.recompute(self.seq, pos + 1)
+            };
         }
         self.pos = pos + 1;
     }
 
     /// Materialize the hash outputs for the current (valid) window.
     fn emit(&mut self) {
-        for si in 0..self.seeds.len() {
-            let s = self.state[si];
-            let slice = &mut self.hashes[si * self.num_hashes..(si + 1) * self.num_hashes];
-            extend_hashes(s.fwd, s.rev, self.k as u32, slice);
+        for (s, out) in self
+            .state
+            .iter()
+            .zip(self.hashes.chunks_exact_mut(self.num_hashes))
+        {
+            extend_hashes(s.fwd, s.rev, self.k as u32, out);
         }
     }
 }
@@ -395,6 +560,7 @@ impl<'a> SeedNtHash<'a> {
 pub struct SeedNtHashBuilder<'a> {
     seq: &'a [u8],
     masks: Vec<String>,
+    seeds: Option<&'a SpacedSeeds>,
     k: u16,
     num_hashes: usize,
     start_pos: usize,
@@ -406,6 +572,7 @@ impl<'a> SeedNtHashBuilder<'a> {
         Self {
             seq,
             masks: Vec::new(),
+            seeds: None,
             k: 0,
             num_hashes: 1,
             start_pos: 0,
@@ -424,6 +591,15 @@ impl<'a> SeedNtHashBuilder<'a> {
         self
     }
 
+    /// Uses precompiled seeds instead of [`masks`](Self::masks), so the lookup
+    /// tables are shared rather than rebuilt for this sequence. Takes precedence
+    /// over `masks`; `k` may be omitted, but if set it must equal
+    /// [`seeds.k()`](SpacedSeeds::k).
+    pub fn seeds(mut self, seeds: &'a SpacedSeeds) -> Self {
+        self.seeds = Some(seeds);
+        self
+    }
+
     /// Specifies number of hashes per spaced seed.
     pub fn num_hashes(mut self, n: usize) -> Self {
         self.num_hashes = n;
@@ -438,13 +614,21 @@ impl<'a> SeedNtHashBuilder<'a> {
 
     /// Finalizes the builder and returns an iterator over the hashes.
     pub fn finish(self) -> Result<SeedNtHashIter<'a>> {
-        let hasher = SeedNtHash::new(
-            self.seq,
-            &self.masks,
-            self.num_hashes,
-            self.k,
-            self.start_pos,
-        )?;
+        let hasher = match self.seeds {
+            Some(seeds) => {
+                if self.k != 0 && self.k != seeds.k() {
+                    return Err(NtHashError::InvalidK);
+                }
+                SeedNtHash::with_seeds(self.seq, seeds, self.num_hashes, self.start_pos)?
+            }
+            None => SeedNtHash::new(
+                self.seq,
+                &self.masks,
+                self.num_hashes,
+                self.k,
+                self.start_pos,
+            )?,
+        };
         Ok(SeedNtHashIter {
             hasher,
             done: false,
@@ -464,8 +648,8 @@ impl<'a> SeedNtHashIter<'a> {
     ///
     /// The [`Iterator`] impl yields an owned `Vec<u64>` per k‑mer (one heap
     /// allocation each); this method lends the internal buffer to `f` instead,
-    /// so the traversal allocates nothing. Traversal stops at the first window
-    /// with an ambiguous base at a care position, mirroring the [`Iterator`].
+    /// so the traversal allocates nothing. Windows with an ambiguous base at a
+    /// care position are skipped, mirroring the [`Iterator`].
     #[inline]
     pub fn for_each_hash<F: FnMut(usize, &[u64])>(mut self, mut f: F) {
         if self.done {
@@ -492,16 +676,6 @@ impl<'a> Iterator for SeedNtHashIter<'a> {
     }
 }
 
-impl<'a> IntoIterator for SeedNtHashBuilder<'a> {
-    type Item = (usize, Vec<u64>);
-    type IntoIter = SeedNtHashIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.finish()
-            .expect("invalid SeedNtHashBuilder configuration")
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Basic Unit Test
 // ─────────────────────────────────────────────────────────────────────────────
@@ -512,8 +686,7 @@ mod tests {
     #[test]
     fn basic_spaced_seed() {
         let seq = b"ATCGTACGATGCATGCATGCTGACG";
-        let masks = vec!["000111".to_string(), "010101".to_string()];
-        let mut h = SeedNtHash::new(seq, &masks, 2, 6, 0).unwrap();
+        let mut h = SeedNtHash::new(seq, &["000111", "010101"], 2, 6, 0).unwrap();
         assert!(h.roll()); // first valid
         let first = h.hashes()[0];
         assert!(h.roll()); // next valid

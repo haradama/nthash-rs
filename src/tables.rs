@@ -125,11 +125,15 @@ pub fn base_code(b: u8) -> usize {
 /// Per-base rolling constants for a fixed `k`, indexed by [`base_code`].
 ///
 /// Supersedes the 256-entry `srol_k` table: only four distinct base
-/// contributions exist, so four constants per table (128 bytes total, held in
-/// registers) are selected by the 2-bit code. This is measurably faster in the
-/// roll hot-path than a variable-index load into a 2 KiB table, and — unlike
-/// the table — needs no heap allocation, which matters when a fresh hasher is
-/// built per short read.
+/// contributions exist, so four constants per table are selected by the 2-bit
+/// code. This is measurably faster in the roll hot-path than a variable-index
+/// load into a 2 KiB table, and — unlike the table — needs no heap allocation,
+/// which matters when a fresh hasher is built per short read.
+///
+/// The forward roll additionally gets two *merged* 16-entry tables
+/// (`next_fwd` / `next_rev`), indexed by [`roll_index`](Self::roll_index), that
+/// fold the outgoing and incoming contributions into a single lookup and XOR
+/// per strand. The per-base tables remain for the backward roll.
 #[derive(Clone)]
 pub struct RollConsts {
     /// `SEED_TAB[base]` — forward incoming contribution.
@@ -140,6 +144,14 @@ pub struct RollConsts {
     pub srolk_rc: [u64; 4],
     /// `SEED_TAB[base & CP_OFF]` — reverse outgoing contribution.
     pub seed_rc: [u64; 4],
+    /// `seed[in] ^ srolk[out]` — the whole forward-strand correction of one
+    /// forward roll: `fwd' = srol(fwd) ^ next_fwd[roll_index(out, in)]`.
+    pub next_fwd: [u64; 16],
+    /// `sror(srolk_rc[in] ^ seed_rc[out])` — the whole reverse-strand
+    /// correction of one forward roll. `sror` is linear over XOR, so
+    /// `sror(rev ^ x) == sror(rev) ^ sror(x)` and the rotated correction can be
+    /// precomputed: `rev' = sror(rev) ^ next_rev[roll_index(out, in)]`.
+    pub next_rev: [u64; 16],
 }
 
 impl RollConsts {
@@ -150,6 +162,8 @@ impl RollConsts {
             srolk: [0; 4],
             srolk_rc: [0; 4],
             seed_rc: [0; 4],
+            next_fwd: [0; 16],
+            next_rev: [0; 16],
         };
         for &b in b"ACGT" {
             let i = base_code(b);
@@ -158,7 +172,28 @@ impl RollConsts {
             c.srolk_rc[i] = srol_table(b & CP_OFF, k as u32);
             c.seed_rc[i] = SEED_TAB[(b & CP_OFF) as usize];
         }
+        for out in 0..4 {
+            for inc in 0..4 {
+                let i = out << 2 | inc;
+                c.next_fwd[i] = c.seed[inc] ^ c.srolk[out];
+                c.next_rev[i] = sror(c.srolk_rc[inc] ^ c.seed_rc[out]);
+            }
+        }
         c
+    }
+
+    /// Index into `next_fwd` / `next_rev` for a forward roll that drops
+    /// `char_out` and takes in `char_in` (both in-contract A/C/G/T bases).
+    #[inline(always)]
+    pub fn roll_index(char_out: u8, char_in: u8) -> usize {
+        base_code(char_out) << 2 | base_code(char_in)
+    }
+
+    /// Roll the forward/reverse strand hashes one base forward.
+    #[inline(always)]
+    pub fn roll(&self, fwd: u64, rev: u64, char_out: u8, char_in: u8) -> (u64, u64) {
+        let i = Self::roll_index(char_out, char_in);
+        (srol(fwd) ^ self.next_fwd[i], sror(rev) ^ self.next_rev[i])
     }
 }
 
@@ -336,6 +371,27 @@ mod tests {
         assert_eq!(srol_table(4, 32), 0x7917_F764_CAE3_023A);
         assert_eq!(srol_table(3, 30), 0x1019_1F69_104A_E464);
         assert_eq!(srol_table(0, 33), 0x0000_0000_0000_0000);
+    }
+
+    /// The merged forward-roll tables must reproduce the textbook two-lookup
+    /// update for every (outgoing, incoming) base pair, in either case.
+    #[test]
+    fn merged_roll_matches_per_base_update() {
+        for k in [1u16, 4, 31, 32, 33, 64, 1023, 1024] {
+            let c = RollConsts::new(k);
+            let (fwd, rev) = (0x0123_4567_89AB_CDEF_u64, 0xFEDC_BA98_7654_3210_u64);
+            // Every base that passes the hashers' `N` gate (`SEED_TAB != SEED_N`).
+            for &out in b"ACGTUacgtu" {
+                for &inc in b"ACGTUacgtu" {
+                    let want_fwd = srol(fwd) ^ SEED_TAB[inc as usize] ^ srol_table(out, k as u32);
+                    let want_rev = sror(
+                        rev ^ srol_table(inc & CP_OFF, k as u32)
+                            ^ SEED_TAB[(out & CP_OFF) as usize],
+                    );
+                    assert_eq!(c.roll(fwd, rev, out, inc), (want_fwd, want_rev), "k={k}");
+                }
+            }
+        }
     }
 
     /// `srol` followed by `sror` repeatedly should restore the original value.

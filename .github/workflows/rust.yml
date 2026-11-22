@@ -26,9 +26,8 @@ jobs:
         run: cargo build --verbose
       - name: Test (unit + property + regression + doc)
         run: cargo test --verbose
-      - name: Rustfmt (advisory)
+      - name: Rustfmt
         run: cargo fmt --check
-        continue-on-error: true
 
   # Build the cargo-fuzz targets so they can't silently rot. Running an actual
   # campaign happens out-of-band; here we only prove the harness compiles.

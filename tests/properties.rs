@@ -25,7 +25,7 @@ use nthash_rs::{
     canonical,
     kmer::{base_forward_hash, base_reverse_hash},
     BlindNtHash, BlindNtHashBuilder, MinimizerBuilder, NtHash, NtHashBuilder, ReadHasher,
-    SeedNtHash,
+    SeedNtHash, SpacedSeeds,
 };
 use proptest::prelude::*;
 use std::collections::{BTreeMap, HashSet};
@@ -241,6 +241,33 @@ proptest! {
         }
     }
 
+    /// The allocation-free `canonical()` iterators yield exactly `hashes()[0]`
+    /// of the general iterators, for both hashers, from any start position.
+    #[test]
+    fn canonical_iterators_match_general(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTNacgtn"[..]), 1..200),
+        k in 1u16..40,
+        num_hashes in 1u8..4,
+        start in 0usize..200,
+    ) {
+        prop_assume!(seq.len() >= k as usize);
+        let pos = start % (seq.len() - k as usize + 1);
+
+        let nt = || NtHashBuilder::new(&seq).k(k).num_hashes(num_hashes).pos(pos).finish().unwrap();
+        let expected: Vec<(usize, u64)> = nt().map(|(p, h)| (p, h[0])).collect();
+        let it = nt().canonical();
+        let upper = it.size_hint().1.unwrap();
+        let got: Vec<(usize, u64)> = it.collect();
+        prop_assert!(got.len() <= upper);
+        prop_assert_eq!(got, expected);
+
+        let bl = || BlindNtHashBuilder::new(&seq).k(k).num_hashes(num_hashes).pos(pos).finish().unwrap();
+        let expected: Vec<(usize, u64)> = bl().map(|(p, h)| (p, h[0])).collect();
+        let it = bl().canonical();
+        prop_assert_eq!(it.len(), expected.len());
+        prop_assert_eq!(it.collect::<Vec<_>>(), expected);
+    }
+
     /// (4) Rolling forward then back returns to exactly the prior hashes.
     #[test]
     fn roll_back_inverts_roll((seq, k) in seq_and_k()) {
@@ -254,6 +281,101 @@ proptest! {
         prop_assert!(h.roll_back()); // and back
         prop_assert_eq!(h.forward_hash(), f0);
         prop_assert_eq!(h.reverse_hash(), r0);
+    }
+
+    /// (4b) Rolling back from the end visits exactly the valid k-mers the forward
+    /// pass visited, in reverse, with identical hashes — including across `N`s.
+    #[test]
+    fn roll_back_retraces_forward_pass(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..200),
+        k in 1u16..12,
+        num_hashes in 1u8..4,
+    ) {
+        prop_assume!(seq.len() >= k as usize);
+        let mut h = NtHash::new(&seq, k, num_hashes, 0).unwrap();
+        let mut fwd = Vec::new();
+        while h.roll() {
+            fwd.push((h.pos(), h.forward_hash(), h.reverse_hash(), h.hashes().to_vec()));
+        }
+        prop_assume!(!fwd.is_empty());
+
+        // A failed roll() leaves the hasher on the last valid k-mer.
+        let last = fwd.last().unwrap();
+        prop_assert_eq!(h.pos(), last.0);
+        prop_assert_eq!(h.hashes(), &last.3[..]);
+
+        let mut back = vec![last.clone()];
+        while h.roll_back() {
+            back.push((h.pos(), h.forward_hash(), h.reverse_hash(), h.hashes().to_vec()));
+            prop_assert!(back.len() <= fwd.len(), "roll_back did not terminate");
+        }
+        back.reverse();
+        prop_assert_eq!(back, fwd);
+    }
+
+    /// (4c) `peek` / `peek_back` report the hashes the next `roll` /
+    /// `roll_back` would produce whenever that step is a plain one-base slide,
+    /// and never move the window.
+    #[test]
+    fn peek_matches_next_roll(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..120),
+        k in 1u16..10,
+    ) {
+        prop_assume!(seq.len() >= k as usize);
+        let mut h = NtHash::new(&seq, k, 2, 0).unwrap();
+        while h.roll() {
+            let (pos, f, r) = (h.pos(), h.forward_hash(), h.reverse_hash());
+
+            if h.peek() {
+                let peeked = h.hashes().to_vec();
+                prop_assert_eq!((h.pos(), h.forward_hash(), h.reverse_hash()), (pos, f, r));
+                let mut next = NtHash::new(&seq, k, 2, pos + 1).unwrap();
+                prop_assert!(next.roll());
+                prop_assert_eq!(next.pos(), pos + 1);
+                prop_assert_eq!(next.hashes(), &peeked[..]);
+            }
+            if h.peek_back() {
+                let peeked = h.hashes().to_vec();
+                prop_assert_eq!((h.pos(), h.forward_hash(), h.reverse_hash()), (pos, f, r));
+                let mut prev = NtHash::new(&seq, k, 2, pos - 1).unwrap();
+                prop_assert!(prev.roll());
+                prop_assert_eq!(prev.pos(), pos - 1);
+                prop_assert_eq!(prev.hashes(), &peeked[..]);
+            }
+        }
+    }
+
+    /// Care indices are a set: order and repeats must not change the result,
+    /// and precompiled shared seeds must behave exactly like per-hasher ones.
+    #[test]
+    fn seed_care_indices_are_a_set_and_shareable(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..150),
+        mask_bits in prop::collection::vec(prop::sample::select(&b"01"[..]), 1..20),
+        dup in prop::collection::vec(any::<prop::sample::Index>(), 0..8),
+    ) {
+        let k = mask_bits.len();
+        prop_assume!(seq.len() >= k);
+        let mask = String::from_utf8(mask_bits.clone()).unwrap();
+        let care: Vec<usize> = (0..k).filter(|&i| mask_bits[i] == b'1').collect();
+
+        let collect = |mut h: SeedNtHash| {
+            let mut out = Vec::new();
+            while h.roll() { out.push((h.pos(), h.hashes().to_vec())); }
+            out
+        };
+        let expected = collect(SeedNtHash::new(&seq, &[&mask], 2, k as u16, 0).unwrap());
+
+        // Reversed, with some indices repeated.
+        let mut messy: Vec<usize> = care.iter().rev().copied().collect();
+        if !care.is_empty() {
+            messy.extend(dup.iter().map(|ix| care[ix.index(care.len())]));
+        }
+        let got = collect(SeedNtHash::from_care_indices(&seq, vec![messy], 2, k as u16, 0).unwrap());
+        prop_assert_eq!(&got, &expected);
+
+        let seeds = SpacedSeeds::from_masks(&[&mask], k as u16).unwrap();
+        let shared = collect(SeedNtHash::with_seeds(&seq, &seeds, 2, 0).unwrap());
+        prop_assert_eq!(&shared, &expected);
     }
 
     /// (5a) `NtHash` and `BlindNtHash` agree on every window of an N-free input.
@@ -319,31 +441,40 @@ proptest! {
         prop_assert_eq!(fwd, rev);
     }
 
-    /// The batch read hasher (AVX2 where available) is bit-identical to
-    /// per-read `BlindNtHash`, across full lane groups and the scalar tail.
+    /// The batch read hasher is bit-identical to per-read `BlindNtHash`, for
+    /// reads of mixed lengths; a read shorter than `k` rejects the batch with
+    /// the error `NtHash::new` gives for it, before anything is emitted.
     #[test]
     fn batch_matches_blind(
-        (len, nreads) in (1usize..40, 1usize..10),
+        lens in prop::collection::vec(0usize..40, 1..10),
         k in 1u16..32,
     ) {
-        prop_assume!((k as usize) <= len);
         // Deterministic ACGT reads derived from indices (no extra strategy noise).
-        let reads_owned: Vec<Vec<u8>> = (0..nreads)
-            .map(|r| (0..len).map(|i| b"ACGT"[(i * 7 + r * 3) % 4]).collect())
+        let reads_owned: Vec<Vec<u8>> = lens.iter().enumerate()
+            .map(|(r, &len)| (0..len).map(|i| b"ACGT"[(i * 7 + r * 3) % 4]).collect())
             .collect();
         let reads: Vec<&[u8]> = reads_owned.iter().map(|v| v.as_slice()).collect();
 
         let mut got = BTreeMap::new();
-        ReadHasher::new(k)
+        let mut order = Vec::new();
+        let res = ReadHasher::new(k)
             .unwrap()
-            .hash_reads(&reads, |ri, pos, h| { got.insert((ri, pos), h); })
-            .unwrap();
+            .hash_reads(&reads, |ri, pos, h| { got.insert((ri, pos), h); order.push((ri, pos)); });
+
+        if let Some(short) = reads.iter().find(|r| r.len() < k as usize) {
+            prop_assert_eq!(res.err(), NtHash::new(short, k, 1, 0).err());
+            prop_assert!(order.is_empty());
+            return Ok(());
+        }
+        prop_assert_eq!(res, Ok(()));
 
         let mut exp = BTreeMap::new();
         for (ri, r) in reads.iter().enumerate() {
             BlindNtHashBuilder::new(r).k(k).num_hashes(1).finish().unwrap()
                 .for_each_hash(|pos, h| { exp.insert((ri, pos), h[0]); });
         }
+        // Emitted exactly once each, ordered by read then position.
+        prop_assert_eq!(order, exp.keys().copied().collect::<Vec<_>>());
         prop_assert_eq!(got, exp);
     }
 
@@ -357,12 +488,33 @@ proptest! {
         k in 0u16..300,
         num_hashes in 0u8..6,
         pos in 0usize..400,
-        w in 0usize..12,
+        w in prop_oneof![0usize..12, Just(usize::MAX), Just(usize::MAX / 2)],
     ) {
         if let Ok(mut h) = NtHash::new(&seq, k, num_hashes, pos) {
             while h.roll() { std::hint::black_box(h.hashes()); }
+            // Walk all the way back, peeking both ways at every stop. Positions
+            // strictly decrease, so this terminates.
+            let mut prev = h.pos() + 1;
+            loop {
+                h.peek();
+                h.peek_back();
+                if !h.roll_back() { break; }
+                prop_assert!(h.pos() < prev, "roll_back must move strictly backward");
+                prev = h.pos();
+            }
+            // ...and forward again from wherever that left us.
+            while h.roll() { std::hint::black_box(h.hashes()); }
         }
-        if let Ok(mut h) = BlindNtHash::new(&seq, k, num_hashes, pos as isize) {
+        // The backward and peek entry points on a *fresh* hasher.
+        if let Ok(mut h) = NtHash::new(&seq, k, num_hashes, pos) {
+            h.roll_back();
+            while h.roll_back() {}
+        }
+        if let Ok(mut h) = NtHash::new(&seq, k, num_hashes, pos) {
+            h.peek();
+            h.peek_back();
+        }
+        if let Ok(mut h) = BlindNtHash::new(&seq, k, num_hashes, pos) {
             // Feed the remaining bytes; the window slides without bounds panics.
             let start = pos + k as usize;
             for &c in seq.iter().skip(start) {
@@ -373,11 +525,12 @@ proptest! {
         if let Ok(mins) = MinimizerBuilder::new(&seq).k(k).w(w).finish() {
             for m in mins { std::hint::black_box(m); }
         }
-        // Batch path over 5 equal-length reads (one AVX2 group + scalar tail).
-        // Arbitrary bytes are out of contract but must not panic.
+        // Batch path over reads of mixed lengths, with and without ones shorter
+        // than k. Arbitrary bytes are out of contract but must not panic.
         if let Ok(h) = ReadHasher::new(k) {
-            let reads = vec![seq.as_slice(); 5];
+            let reads: [&[u8]; 4] = [&seq, &seq[seq.len() / 2..], &[], &seq];
             let _ = h.hash_reads(&reads, |_, _, hash| { std::hint::black_box(hash); });
+            let _ = h.hash_reads(&reads[..2], |_, _, hash| { std::hint::black_box(hash); });
         }
     }
 

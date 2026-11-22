@@ -31,8 +31,11 @@ use crate::{
 /// The window is stored in a `VecDeque<u8>`:
 /// - `roll()` removes the **front** base and pushes a new base at the **back**.
 /// - `roll_back()` does the opposite.
-/// - `peek()` / `peek_back()` compute hashes for the next / previous window
-///   **without** mutating internal state.
+/// - `peek()` / `peek_back()` write the hashes of the next / previous window
+///   to the buffer returned by `hashes()` **without** moving the window.
+///
+/// The position is signed because the caller may `roll_back` past the point
+/// where the hasher was created.
 pub struct BlindNtHash {
     window: VecDeque<u8>,
     k: u16,
@@ -56,7 +59,7 @@ impl BlindNtHash {
     /// # Errors
     ///
     /// Returns if `k == 0`, `seq.len() < k`, or `pos` too large.
-    pub fn new(seq: &[u8], k: u16, num_hashes: u8, pos: isize) -> Result<Self> {
+    pub fn new(seq: &[u8], k: u16, num_hashes: u8, pos: usize) -> Result<Self> {
         if k == 0 {
             return Err(NtHashError::InvalidK);
         }
@@ -68,14 +71,11 @@ impl BlindNtHash {
             return Err(NtHashError::SequenceTooShort { seq_len: len, k });
         }
 
-        if pos < 0 || (pos as usize) > len - k_usz {
-            return Err(NtHashError::PositionOutOfRange {
-                pos: pos as usize,
-                seq_len: len,
-            });
+        if pos > len - k_usz {
+            return Err(NtHashError::PositionOutOfRange { pos, seq_len: len });
         }
 
-        let slice = &seq[(pos as usize)..(pos as usize + k_usz)];
+        let slice = &seq[pos..pos + k_usz];
         let mut window = VecDeque::with_capacity(k_usz);
         window.extend(slice.iter().copied());
 
@@ -88,7 +88,8 @@ impl BlindNtHash {
         Ok(Self {
             window,
             k,
-            pos,
+            // A slice index always fits in `isize`.
+            pos: pos as isize,
             fwd_hash,
             rev_hash,
             hashes,
@@ -96,7 +97,10 @@ impl BlindNtHash {
         })
     }
 
-    /// Returns `true` if a new valid hash was produced.
+    /// Slide the window forward by one base, feeding `char_in` at the back.
+    ///
+    /// Always returns `true`: the blind variant never rejects a base. The
+    /// return value exists for parity with [`NtHash::roll`](crate::NtHash::roll).
     pub fn roll(&mut self, char_in: u8) -> bool {
         let char_out = self
             .window
@@ -116,6 +120,8 @@ impl BlindNtHash {
         true
     }
 
+    /// Slide the window backward by one base, feeding `char_in` at the front.
+    /// Always returns `true` (see [`roll`](Self::roll)).
     pub fn roll_back(&mut self, char_in: u8) -> bool {
         debug_assert_eq!(self.window.len(), self.k as usize);
         let char_out = self
@@ -136,7 +142,9 @@ impl BlindNtHash {
         true
     }
 
-    /// Compute hashes for the **next** window without mutating `self`.
+    /// Write the hashes of the **next** window (as if `char_in` were rolled in)
+    /// to the buffer returned by [`hashes`](Self::hashes), without moving the
+    /// window.
     pub fn peek(&mut self, char_in: u8) {
         let char_out = *self.window.front().unwrap();
         let fwd = next_forward_hash(&self.srol_k, self.fwd_hash, char_out, char_in);
@@ -144,6 +152,7 @@ impl BlindNtHash {
         extend_hashes(fwd, rev, self.k as u32, &mut self.hashes);
     }
 
+    /// Backward counterpart of [`peek`](Self::peek).
     pub fn peek_back(&mut self, char_in: u8) {
         let char_out = *self.window.back().unwrap();
         let fwd = prev_forward_hash(&self.srol_k, self.fwd_hash, char_out, char_in);
@@ -225,7 +234,7 @@ impl<'a> BlindNtHashBuilder<'a> {
     }
 
     pub fn finish(self) -> Result<BlindNtHashIter<'a>> {
-        let hasher = BlindNtHash::new(self.seq, self.k, self.num_hashes, self.start_pos as isize)?;
+        let hasher = BlindNtHash::new(self.seq, self.k, self.num_hashes, self.start_pos)?;
         let end = self.seq.len() - self.k as usize;
         Ok(BlindNtHashIter {
             seq: self.seq,
@@ -244,6 +253,28 @@ pub struct BlindNtHashIter<'a> {
 }
 
 impl<'a> BlindNtHashIter<'a> {
+    /// Turn this into an iterator over `(pos, canonical_hash)` — one `u64` per
+    /// window and **no allocation**, unlike the `Vec`-yielding [`Iterator`]
+    /// impl. It is the iterator-shaped counterpart of
+    /// [`for_each_canonical`](Self::for_each_canonical) and likewise yields
+    /// exactly one hash per window regardless of `num_hashes`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use nthash_rs::BlindNtHashBuilder;
+    /// # fn main() -> nthash_rs::Result<()> {
+    /// let n = BlindNtHashBuilder::new(b"ACGTACGTAC").k(4).finish()?
+    ///     .canonical()
+    ///     .count();
+    /// assert_eq!(n, 7);
+    /// # Ok(()) }
+    /// ```
+    #[inline]
+    pub fn canonical(self) -> BlindNtHashCanonicalIter<'a> {
+        BlindNtHashCanonicalIter { inner: self }
+    }
+
     /// Drive the hasher to completion, invoking `f(pos, &hashes)` for each
     /// window **without allocating**.
     ///
@@ -320,15 +351,47 @@ impl<'a> Iterator for BlindNtHashIter<'a> {
     }
 }
 
-impl<'a> IntoIterator for BlindNtHashBuilder<'a> {
-    type Item = (usize, Vec<u64>);
-    type IntoIter = BlindNtHashIter<'a>;
+/// Allocation-free iterator yielding `(pos, canonical_hash)` for each window.
+/// Created by [`BlindNtHashIter::canonical`].
+pub struct BlindNtHashCanonicalIter<'a> {
+    inner: BlindNtHashIter<'a>,
+}
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.finish()
-            .expect("invalid BlindNtHashBuilder configuration")
+impl Iterator for BlindNtHashCanonicalIter<'_> {
+    type Item = (usize, u64);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let it = &mut self.inner;
+        let h = &mut it.hasher;
+        if it.first {
+            it.first = false;
+        } else {
+            let cur = h.pos as usize;
+            if cur >= it.end {
+                return None;
+            }
+            // Read both bases straight from the sequence; the ring-buffer
+            // window is not needed (nor kept up to date) on this path.
+            let char_out = it.seq[cur];
+            let char_in = it.seq[cur + h.k as usize];
+            h.fwd_hash = next_forward_hash(&h.srol_k, h.fwd_hash, char_out, char_in);
+            h.rev_hash = next_reverse_hash(&h.srol_k, h.rev_hash, char_out, char_in);
+            h.pos += 1;
+        }
+        Some((h.pos as usize, canonical(h.fwd_hash, h.rev_hash)))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let it = &self.inner;
+        let n = it.end.saturating_sub(it.hasher.pos as usize) + usize::from(it.first);
+        (n, Some(n))
     }
 }
+
+impl ExactSizeIterator for BlindNtHashCanonicalIter<'_> {}
+impl std::iter::FusedIterator for BlindNtHashCanonicalIter<'_> {}
 
 #[cfg(test)]
 mod tests {

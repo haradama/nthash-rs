@@ -15,7 +15,7 @@ use nthash_rs::{kmer::NtHashBuilder, BlindNtHashBuilder};
 ///
 /// The sequence is deliberately **N‑free**: the three ntHash variants handle
 /// ambiguous bases differently (`NtHash` skips N‑windows, `BlindNtHash` assumes
-/// none exist, `SeedNtHash` stops at the first N on a care site), so only an
+/// none exist, `SeedNtHash` skips windows with an N on a care site), so only an
 /// N‑free input yields an apples‑to‑apples throughput comparison in which every
 /// hasher processes all `len − k + 1` windows. N‑handling correctness is
 /// covered by the regression tests, not here.

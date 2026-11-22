@@ -30,6 +30,10 @@ until then the committed panel is the anchor. Keep additions small and readable
 — the point is to cover *new shapes* (k around the 4-mer chunk boundary, k=1,
 k>sequence edge cases, seeds with N at care sites), not volume.
 
+`regression_edge_cases.rs` pins down edge cases that once panicked, hung, or
+returned the wrong k-mer (rolling back across or after an `N`, the first call on
+a fresh hasher, oversized minimizer windows, duplicate care indices).
+
 ## 2. Property tests (structural correctness on every input)
 
 `properties.rs` uses `proptest` to assert the invariants that hold for *all*
@@ -41,6 +45,9 @@ inputs, so they cannot be satisfied by an accidental constant:
 | Canonical invariant under reverse-complement | the defining property of ntHash |
 | Strand symmetry: `fwd(kmer) == rev(revcomp)` | forward/reverse tables are consistent |
 | `roll` ∘ `roll_back` = identity | the incremental update is exactly invertible |
+| `roll_back` from the end retraces the forward pass (with `N`) | backward `N`-skipping visits the same k-mers and terminates |
+| `peek` / `peek_back` == the neighbouring k-mer's hashes | peeking is consistent with rolling and does not move the window |
+| care indices behave as a set; shared `SpacedSeeds` == per-hasher masks | seed precompilation is input-order independent and reusable |
 | `NtHash` == `BlindNtHash`; all-ones `SeedNtHash` == `NtHash` | the three code paths agree |
 
 These are an *oracle-free* net: no reference implementation is needed to run

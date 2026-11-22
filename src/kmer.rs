@@ -16,11 +16,8 @@ use crate::{
     constants::*,
     tables::{base_code, srol, srol_n, sror, RollConsts},
     util::{canonical, extend_hashes},
-    NtHashError, // unified crate-level error
+    NtHashError, Result,
 };
-
-/// Convenient alias for fallible operations in this module.
-pub type Result<T> = crate::Result<T>;
 
 /// Rolling k‑mer hasher over a contiguous DNA sequence.
 ///
@@ -29,6 +26,11 @@ pub type Result<T> = crate::Result<T>;
 /// - `roll()` / `roll_back()` advance by one base, handling skips transparently.
 /// - Each valid k‑mer emits `num_hashes` values: the canonical hash plus
 ///   extra mixes.
+/// - On a fresh hasher, the first call to any of `roll`, `roll_back`, `peek*`
+///   only *initializes*: it positions on the first valid k‑mer at or after the
+///   starting `pos` and reports whether one exists.
+/// - A call that returns `false` leaves the hasher on its current k‑mer, so
+///   `pos()`, `hashes()` and further rolling in either direction stay valid.
 pub struct NtHash<'a> {
     seq: &'a [u8],
     k: u16,
@@ -106,31 +108,36 @@ impl<'a> NtHash<'a> {
         }
         let incoming = self.seq[self.pos + k_usz];
         if SEED_TAB[incoming as usize] == SEED_N {
-            self.pos += k_usz;
-            return self.init_advance();
+            // Every window overlapping the ambiguous base is invalid; resume
+            // scanning just past it.
+            return match resume_after(self.seq, self.k, self.pos + k_usz) {
+                Some((pos, fwd, rev)) => {
+                    (self.pos, self.fwd_hash, self.rev_hash) = (pos, fwd, rev);
+                    true
+                }
+                None => false,
+            };
         }
         let outgoing = self.seq[self.pos];
-        self.fwd_hash = next_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
-        self.rev_hash = next_reverse_hash(&self.consts, self.rev_hash, outgoing, incoming);
+        (self.fwd_hash, self.rev_hash) =
+            self.consts
+                .roll(self.fwd_hash, self.rev_hash, outgoing, incoming);
         self.pos += 1;
         true
     }
 
     /// Move backward by one base, skipping over k‑mers with `N`.
+    /// Returns `true` if a new valid hash was produced.
     pub fn roll_back(&mut self) -> bool {
-        if !self.initialized && !self.init() {
-            return false;
+        if !self.initialized {
+            return self.init();
         }
         if self.pos == 0 {
             return false;
         }
         let incoming = self.seq[self.pos - 1];
         if SEED_TAB[incoming as usize] == SEED_N {
-            if self.pos < self.k as usize {
-                return false;
-            }
-            self.pos -= self.k as usize;
-            return self.init();
+            return self.init_back();
         }
         let outgoing = self.seq[self.pos + self.k as usize - 1];
         self.fwd_hash = prev_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
@@ -140,8 +147,16 @@ impl<'a> NtHash<'a> {
         true
     }
 
-    /// Peek the next k‑mer without mutating self.
+    /// Peek the next k‑mer: write its hashes to the buffer returned by
+    /// [`hashes`](Self::hashes) without moving the window. `pos()`,
+    /// `forward_hash()` and `reverse_hash()` keep describing the current k‑mer.
+    ///
+    /// Returns `false` (buffer untouched) at the end of the sequence or when the
+    /// incoming base is ambiguous.
     pub fn peek(&mut self) -> bool {
+        if !self.initialized {
+            return self.init();
+        }
         if self.pos >= self.seq.len() - self.k as usize {
             return false;
         }
@@ -149,23 +164,28 @@ impl<'a> NtHash<'a> {
         self.peek_char(incoming)
     }
 
-    /// Peek with an explicit incoming byte.
+    /// Like [`peek`](Self::peek), with an explicit incoming byte.
     pub fn peek_char(&mut self, incoming: u8) -> bool {
-        if !self.initialized && !self.init() {
-            return false;
+        if !self.initialized {
+            return self.init();
         }
         if SEED_TAB[incoming as usize] == SEED_N {
             return false;
         }
         let outgoing = self.seq[self.pos];
-        let fwd = next_forward_hash(&self.consts, self.fwd_hash, outgoing, incoming);
-        let rev = next_reverse_hash(&self.consts, self.rev_hash, outgoing, incoming);
+        let (fwd, rev) = self
+            .consts
+            .roll(self.fwd_hash, self.rev_hash, outgoing, incoming);
         self.fill_hash_buffer(fwd, rev);
         true
     }
 
-    /// Peek the previous k‑mer without mutating self.
+    /// Peek the previous k‑mer; the backward counterpart of
+    /// [`peek`](Self::peek).
     pub fn peek_back(&mut self) -> bool {
+        if !self.initialized {
+            return self.init();
+        }
         if self.pos == 0 {
             return false;
         }
@@ -173,10 +193,10 @@ impl<'a> NtHash<'a> {
         self.peek_back_char(incoming)
     }
 
-    /// Peek backward with explicit incoming byte.
+    /// Like [`peek_back`](Self::peek_back), with an explicit incoming byte.
     pub fn peek_back_char(&mut self, incoming: u8) -> bool {
-        if !self.initialized && !self.init() {
-            return false;
+        if !self.initialized {
+            return self.init();
         }
         if SEED_TAB[incoming as usize] == SEED_N {
             return false;
@@ -222,22 +242,60 @@ impl<'a> NtHash<'a> {
         }
     }
 
-    /// Position on the first valid k‑mer, updating the forward/reverse hashes but
-    /// not the materialized buffer.
+    /// Position on the first valid k‑mer at or after the current position,
+    /// updating the forward/reverse hashes but not the materialized buffer.
+    #[inline]
     fn init_advance(&mut self) -> bool {
-        let k_usz = self.k as usize;
-        while self.pos <= self.seq.len() - k_usz {
-            let mut skip = 0;
-            if has_invalid_base(&self.seq[self.pos..], k_usz, &mut skip) {
-                self.pos += skip + 1;
-                continue;
+        self.init_from(self.pos)
+    }
+
+    /// Position on the first valid k‑mer starting at or after `start`.
+    ///
+    /// State is committed only on success: when no valid k‑mer remains, `pos`
+    /// and the hashes are left untouched, so the hasher still describes the
+    /// k‑mer it was on (and can be rolled back from it).
+    fn init_from(&mut self, start: usize) -> bool {
+        match first_valid_window(self.seq, self.k, start) {
+            Some((pos, fwd, rev)) => {
+                (self.pos, self.fwd_hash, self.rev_hash) = (pos, fwd, rev);
+                self.initialized = true;
+                true
             }
-            self.fwd_hash = base_forward_hash(&self.seq[self.pos..], self.k);
-            self.rev_hash = base_reverse_hash(&self.seq[self.pos..], self.k);
-            self.initialized = true;
-            return true;
+            None => false,
+        }
+    }
+
+    /// Position on the last valid k‑mer starting strictly before the current
+    /// position (the backward counterpart of [`init_from`](Self::init_from)),
+    /// materializing the hash buffer. Leaves the state untouched on failure.
+    fn init_back(&mut self) -> bool {
+        let k_usz = self.k as usize;
+        let mut pos = self.pos;
+        while pos > 0 {
+            pos -= 1;
+            let Some(idx) = first_invalid_base(&self.seq[pos..pos + k_usz]) else {
+                self.set_window(pos);
+                self.update_hashes();
+                return true;
+            };
+            // Every window covering the ambiguous base at `pos + idx` is
+            // invalid; the next candidate ends just before it.
+            let bad = pos + idx;
+            if bad < k_usz {
+                return false;
+            }
+            pos = bad - k_usz + 1; // decremented at the loop top
         }
         false
+    }
+
+    /// Recompute the forward/reverse hashes from scratch for the (valid) window
+    /// starting at `pos` and move there.
+    fn set_window(&mut self, pos: usize) {
+        self.fwd_hash = base_forward_hash(&self.seq[pos..], self.k);
+        self.rev_hash = base_reverse_hash(&self.seq[pos..], self.k);
+        self.pos = pos;
+        self.initialized = true;
     }
 
     #[inline(always)]
@@ -256,19 +314,59 @@ impl<'a> NtHash<'a> {
     }
 }
 
-#[inline(always)]
-pub fn has_invalid_base(seq: &[u8], k: usize, pos_n: &mut usize) -> bool {
-    if let Some(idx) = seq[..k]
-        .iter()
-        .rposition(|&c| SEED_TAB[c as usize] == SEED_N)
-    {
-        *pos_n = idx;
-        true
-    } else {
-        false
+/// Find the first valid k‑mer starting at or after `start` and hash it from
+/// scratch, returning `(pos, forward_hash, reverse_hash)`.
+///
+/// Requires `seq.len() >= k`.
+fn first_valid_window(seq: &[u8], k: u16, start: usize) -> Option<(usize, u64, u64)> {
+    let k_usz = k as usize;
+    let last = seq.len() - k_usz;
+    let mut pos = start;
+    while pos <= last {
+        if let Some(idx) = last_invalid_base(&seq[pos..pos + k_usz]) {
+            pos += idx + 1;
+            continue;
+        }
+        let window = &seq[pos..];
+        return Some((
+            pos,
+            base_forward_hash(window, k),
+            base_reverse_hash(window, k),
+        ));
     }
+    None
 }
 
+/// Out-of-line N-skip for the rolling loops: the first valid k‑mer after the
+/// ambiguous base at index `n_pos` (every window overlapping it is invalid).
+///
+/// Deliberately never inlined, and taking and returning plain values rather
+/// than `&mut NtHash`. Folding the O(k) re-initialization into a hot loop — or
+/// letting a pointer to the rolling state escape into a call — makes the
+/// optimizer keep that state on the stack and reload it on every base, which
+/// puts a store-to-load round trip on the loop-carried hash dependency.
+#[cold]
+#[inline(never)]
+fn resume_after(seq: &[u8], k: u16, n_pos: usize) -> Option<(usize, u64, u64)> {
+    first_valid_window(seq, k, n_pos + 1)
+}
+
+/// Index of the last ambiguous (non‑ACGT) base in `window`, if any.
+#[inline(always)]
+fn last_invalid_base(window: &[u8]) -> Option<usize> {
+    window.iter().rposition(|&c| SEED_TAB[c as usize] == SEED_N)
+}
+
+/// Index of the first ambiguous (non‑ACGT) base in `window`, if any.
+#[inline(always)]
+fn first_invalid_base(window: &[u8]) -> Option<usize> {
+    window.iter().position(|&c| SEED_TAB[c as usize] == SEED_N)
+}
+
+/// Forward‑strand hash of the k‑mer `seq[..k]`, computed from scratch in O(k).
+///
+/// # Panics
+/// Panics if `seq.len() < k`.
 #[inline]
 pub fn base_forward_hash(seq: &[u8], k: u16) -> u64 {
     let k = k as usize;
@@ -304,6 +402,11 @@ pub fn base_forward_hash(seq: &[u8], k: u16) -> u64 {
     h
 }
 
+/// Reverse‑complement hash of the k‑mer `seq[..k]`, computed from scratch in
+/// O(k).
+///
+/// # Panics
+/// Panics if `seq.len() < k`.
 #[inline]
 pub fn base_reverse_hash(seq: &[u8], k: u16) -> u64 {
     let k = k as usize;
@@ -348,24 +451,9 @@ pub fn base_reverse_hash(seq: &[u8], k: u16) -> u64 {
 }
 
 #[inline(always)]
-fn next_forward_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
-    let mut h = srol(prev);
-    h ^= c.seed[base_code(char_in)];
-    h ^= c.srolk[base_code(char_out)];
-    h
-}
-
-#[inline(always)]
 fn prev_forward_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
     let mut h = prev ^ c.srolk[base_code(char_in)];
     h ^= c.seed[base_code(char_out)];
-    sror(h)
-}
-
-#[inline(always)]
-fn next_reverse_hash(c: &RollConsts, prev: u64, char_out: u8, char_in: u8) -> u64 {
-    let mut h = prev ^ c.srolk_rc[base_code(char_in)];
-    h ^= c.seed_rc[base_code(char_out)];
     sror(h)
 }
 
@@ -429,12 +517,57 @@ impl<'a> NtHashBuilder<'a> {
 }
 
 /// Iterator yielding `(pos, Vec<u64>)` for each valid k‑mer.
+///
+/// Every item owns a freshly allocated `Vec`. When one hash per k‑mer is
+/// enough, [`canonical`](Self::canonical) gives an allocation-free iterator;
+/// to borrow all `num_hashes` values without allocating, use
+/// [`for_each_hash`](Self::for_each_hash).
 pub struct NtHashIter<'a> {
     hasher: NtHash<'a>,
     done: bool,
 }
 
 impl<'a> NtHashIter<'a> {
+    /// Turn this into an iterator over `(pos, canonical_hash)` — one `u64` per
+    /// valid k‑mer and **no allocation**, several times faster than iterating
+    /// the `Vec`-yielding [`Iterator`] impl.
+    ///
+    /// Like [`for_each_canonical`](Self::for_each_canonical), it ignores
+    /// `num_hashes` and yields exactly the canonical hash (what `hashes()[0]`
+    /// would be), but as a regular iterator that composes with adapters.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use nthash_rs::NtHashBuilder;
+    /// # fn main() -> nthash_rs::Result<()> {
+    /// let min = NtHashBuilder::new(b"ACGTNACGTACG").k(4).finish()?
+    ///     .canonical()
+    ///     .map(|(_pos, hash)| hash)
+    ///     .min();
+    /// assert!(min.is_some());
+    /// # Ok(()) }
+    /// ```
+    #[inline]
+    pub fn canonical(self) -> NtHashCanonicalIter<'a> {
+        let h = self.hasher;
+        NtHashCanonicalIter {
+            seq: h.seq,
+            k: h.k,
+            consts: h.consts,
+            pos: h.pos,
+            fwd: h.fwd_hash,
+            rev: h.rev_hash,
+            state: if self.done {
+                CanonicalState::Done
+            } else if h.initialized {
+                CanonicalState::Rolling
+            } else {
+                CanonicalState::Fresh
+            },
+        }
+    }
+
     /// Drive the hasher to completion, invoking `f(pos, &hashes)` for each
     /// valid k‑mer **without allocating**.
     ///
@@ -488,32 +621,34 @@ impl<'a> NtHashIter<'a> {
         }
         let last = len - k; // last valid k-mer start index
 
-        // Prime once: position on the first valid k-mer. This hoists the
-        // `initialized` check out of the hot loop below (it recurs only on an
-        // actual N-skip), leaving a tight roll with each byte read exactly once.
+        // Prime once: position on the first valid k-mer (or, for a hasher that
+        // was already rolled, step to the next one). This hoists the
+        // `initialized` check out of the hot loop below, leaving a tight roll
+        // with each byte read exactly once.
         if !h.advance() {
             return;
         }
+        // Keep the rolling state in locals so it lives in registers for the whole
+        // traversal; the hasher itself is not touched again.
+        let consts = &h.consts;
+        let (mut pos, mut fwd, mut rev) = (h.pos, h.fwd_hash, h.rev_hash);
         loop {
-            f(h.pos, canonical(h.fwd_hash, h.rev_hash));
-            if h.pos >= last {
+            f(pos, canonical(fwd, rev));
+            if pos >= last {
                 return;
             }
-            let incoming = seq[h.pos + k];
+            let incoming = seq[pos + k];
             if SEED_TAB[incoming as usize] == SEED_N {
                 // N-skip: jump past the ambiguous base and re-init, exactly as
                 // `roll` does; the loop top then emits the next run's first k-mer.
-                h.pos += k;
-                h.initialized = false;
-                if !h.advance() {
-                    return;
+                match resume_after(seq, h.k, pos + k) {
+                    Some(next) => (pos, fwd, rev) = next,
+                    None => return,
                 }
                 continue;
             }
-            let outgoing = seq[h.pos];
-            h.fwd_hash = next_forward_hash(&h.consts, h.fwd_hash, outgoing, incoming);
-            h.rev_hash = next_reverse_hash(&h.consts, h.rev_hash, outgoing, incoming);
-            h.pos += 1;
+            (fwd, rev) = consts.roll(fwd, rev, seq[pos], incoming);
+            pos += 1;
         }
     }
 }
@@ -534,11 +669,84 @@ impl<'a> Iterator for NtHashIter<'a> {
     }
 }
 
-impl<'a> IntoIterator for NtHashBuilder<'a> {
-    type Item = (usize, Vec<u64>);
-    type IntoIter = NtHashIter<'a>;
+/// Allocation-free iterator yielding `(pos, canonical_hash)` for each valid
+/// k‑mer. Created by [`NtHashIter::canonical`].
+///
+/// It carries its own copy of the rolling state (rather than wrapping an
+/// [`NtHash`]) so that no pointer to it ever leaves `next`, which lets the
+/// optimizer keep the hashes in registers across a `for` loop.
+pub struct NtHashCanonicalIter<'a> {
+    seq: &'a [u8],
+    k: u16,
+    consts: RollConsts,
+    /// Start of the current k‑mer (or the start position while `Fresh`).
+    pos: usize,
+    fwd: u64,
+    rev: u64,
+    state: CanonicalState,
+}
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.finish().expect("invalid NtHashBuilder configuration")
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CanonicalState {
+    /// Nothing emitted yet: the first k‑mer at or after `pos` is still to be found.
+    Fresh,
+    /// `pos` / `fwd` / `rev` describe the k‑mer emitted last.
+    Rolling,
+    /// The sequence is exhausted.
+    Done,
+}
+
+impl Iterator for NtHashCanonicalIter<'_> {
+    type Item = (usize, u64);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let k = self.k as usize;
+        let next = match self.state {
+            CanonicalState::Rolling => {
+                if self.pos >= self.seq.len() - k {
+                    None
+                } else {
+                    let incoming = self.seq[self.pos + k];
+                    if SEED_TAB[incoming as usize] == SEED_N {
+                        resume_after(self.seq, self.k, self.pos + k)
+                    } else {
+                        let (fwd, rev) =
+                            self.consts
+                                .roll(self.fwd, self.rev, self.seq[self.pos], incoming);
+                        Some((self.pos + 1, fwd, rev))
+                    }
+                }
+            }
+            CanonicalState::Fresh => {
+                self.state = CanonicalState::Rolling;
+                first_valid_window(self.seq, self.k, self.pos)
+            }
+            CanonicalState::Done => None,
+        };
+        match next {
+            Some((pos, fwd, rev)) => {
+                (self.pos, self.fwd, self.rev) = (pos, fwd, rev);
+                Some((pos, canonical(fwd, rev)))
+            }
+            None => {
+                self.state = CanonicalState::Done;
+                None
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // At most one k-mer per remaining start position; `N`s may remove any.
+        let last = self.seq.len() - self.k as usize;
+        let remaining = match self.state {
+            CanonicalState::Fresh => last - self.pos + 1,
+            CanonicalState::Rolling => last - self.pos,
+            CanonicalState::Done => 0,
+        };
+        (0, Some(remaining))
     }
 }
+
+impl std::iter::FusedIterator for NtHashCanonicalIter<'_> {}
