@@ -87,16 +87,18 @@ line of the library (the `coverage` job). To check locally:
 
 ```bash
 cargo install cargo-llvm-cov        # needs the llvm-tools-preview component
-CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_TEST_OPT_LEVEL=0 \
+CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_TEST_OPT_LEVEL=0 CARGO_INCREMENTAL=1 \
   cargo llvm-cov --fail-under-lines 100 --show-missing-lines
 ```
 
 Things to know when the gate fails unexpectedly:
 
-- Measure at opt-level 0, as above. With optimizations on, a function inlined
-  into several test binaries is instrumented differently in each; the report
-  then warns that "functions have mismatched data" and drops their counts, so
-  the result varies from run to run.
+- Measure at opt-level 0 with incremental compilation on, as above. With
+  optimizations on, or with `CARGO_INCREMENTAL=0` (which CI actions set by
+  default), the same function can be instrumented differently in each test
+  binary; the report then warns that "functions have mismatched data" and drops
+  their counts, so the result varies from run to run. A run without that
+  warning is the one to trust.
 - Do not rely on a property test to reach a line by chance (a random `k`
   happening to be `0`, say). Give every error path a deterministic test.
 - Use one target directory per toolchain; objects left by another compiler
