@@ -29,6 +29,19 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --check
 
+  # Every line of the library must be executed by the test suite.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Line coverage (must be complete)
+        run: cargo llvm-cov --fail-under-lines 100 --show-missing-lines
+
   # Build the cargo-fuzz targets so they can't silently rot. Running an actual
   # campaign happens out-of-band; here we only prove the harness compiles.
   fuzz-build:

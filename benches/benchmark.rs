@@ -13,7 +13,7 @@ use nthash_rs::{kmer::NtHashBuilder, BlindNtHashBuilder};
 
 /// Generate a DNA sequence of length `len` by cycling through "ACGT".
 ///
-/// The sequence is deliberately **N‑free**: the three ntHash variants handle
+/// The sequence is deliberately **N‑free**: the ntHash variants handle
 /// ambiguous bases differently (`NtHash` skips N‑windows, `BlindNtHash` assumes
 /// none exist, `SeedNtHash` skips windows with an N on a care site), so only an
 /// N‑free input yields an apples‑to‑apples throughput comparison in which every
@@ -117,8 +117,8 @@ fn bench_seednthash(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(seq.len() as u64));
 
     // All-ones mask: every position is a care site (contiguous k-mer), so the
-    // spaced-seed path does real work comparable to the other variants. The
-    // previous all-zeros mask had no care sites and hashed nothing.
+    // spaced-seed path does real work comparable to the other variants. (An
+    // all-zeros mask has no care sites and would hash nothing.)
     let mask = "1".repeat(k as usize);
     group.bench_with_input(BenchmarkId::new("SeedNtHash", seq.len()), &seq, |b, seq| {
         b.iter(|| {

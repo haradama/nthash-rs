@@ -184,7 +184,7 @@ pub struct Minimizers<'a> {
 impl Minimizers<'_> {
     /// Drive the scan to completion, invoking `f` for each selected minimizer in
     /// a single tight loop — no per-item `Iterator::next` boundary. Equivalent
-    /// to `for m in self { f(m) }` but measurably faster on long sequences.
+    /// to `for m in self { f(m) }`.
     #[inline]
     pub fn for_each<F: FnMut(Minimizer)>(mut self, mut f: F) {
         while let Some(m) = self.step() {

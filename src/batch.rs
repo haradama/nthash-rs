@@ -7,10 +7,8 @@
 //! sequencing, where inputs are millions of short reads. Reads may differ in
 //! length, but each must be at least `k` long.
 //!
-//! Each read is rolled with a plain scalar loop. An earlier version rolled
-//! four reads in lockstep with AVX2 / NEON kernels, but once the outgoing and
-//! incoming contributions were merged into a single table lookup the scalar
-//! roll measured faster than those kernels, so they were removed.
+//! Each read is rolled independently, with the same forward roll
+//! [`NtHash`](crate::kmer) uses.
 //!
 //! Like [`BlindNtHash`](crate::blind), this fast path assumes **N-free A/C/G/T**
 //! input: it does not skip ambiguous bases. Use [`NtHash`](crate::kmer) when the

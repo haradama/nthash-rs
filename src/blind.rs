@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 
 use crate::{
-    constants::{CP_OFF, SEED_TAB},
+    constants::{ASCII_SIZE, CP_OFF, SEED_TAB},
     kmer::{base_forward_hash, base_reverse_hash},
     tables::{build_srol_k, srol, sror},
     util::{canonical, extend_hashes},
@@ -45,9 +45,9 @@ pub struct BlindNtHash {
     hashes: Vec<u64>,
     /// Precomputed `srol_table(c, k)` for every byte value `c`. Unlike
     /// [`NtHash`](crate::kmer), the blind variant does not gate out `N`, so it
-    /// needs the full byte-indexed table (where `N` maps to `0`) rather than the
-    /// 4-constant `RollConsts` (which would fold `N` onto `G`).
-    srol_k: Box<[u64; 256]>,
+    /// needs the full byte-indexed table (where `N` maps to `0`) rather than
+    /// the base-code-indexed `RollConsts` (which would fold `N` onto `G`).
+    srol_k: Box<[u64; ASCII_SIZE]>,
 }
 
 impl BlindNtHash {
@@ -182,22 +182,22 @@ impl BlindNtHash {
 }
 
 #[inline(always)]
-fn next_forward_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+fn next_forward_hash(srol_k: &[u64; ASCII_SIZE], prev: u64, char_out: u8, char_in: u8) -> u64 {
     srol(prev) ^ SEED_TAB[char_in as usize] ^ srol_k[char_out as usize]
 }
 
 #[inline(always)]
-fn prev_forward_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+fn prev_forward_hash(srol_k: &[u64; ASCII_SIZE], prev: u64, char_out: u8, char_in: u8) -> u64 {
     sror(prev ^ srol_k[char_in as usize] ^ SEED_TAB[char_out as usize])
 }
 
 #[inline(always)]
-fn next_reverse_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+fn next_reverse_hash(srol_k: &[u64; ASCII_SIZE], prev: u64, char_out: u8, char_in: u8) -> u64 {
     sror(prev ^ srol_k[(char_in & CP_OFF) as usize] ^ SEED_TAB[(char_out & CP_OFF) as usize])
 }
 
 #[inline(always)]
-fn prev_reverse_hash(srol_k: &[u64; 256], prev: u64, char_out: u8, char_in: u8) -> u64 {
+fn prev_reverse_hash(srol_k: &[u64; ASCII_SIZE], prev: u64, char_out: u8, char_in: u8) -> u64 {
     srol(prev) ^ SEED_TAB[(char_in & CP_OFF) as usize] ^ srol_k[(char_out & CP_OFF) as usize]
 }
 
@@ -399,9 +399,9 @@ mod tests {
 
     #[test]
     fn too_short_sequence_errors_without_panicking() {
-        match BlindNtHash::new(b"ACG", 4, 1, 0) {
-            Err(NtHashError::SequenceTooShort { seq_len: 3, k: 4 }) => {}
-            other => panic!("expected SequenceTooShort, got {:?}", other.map(|_| ())),
-        }
+        assert_eq!(
+            BlindNtHash::new(b"ACG", 4, 1, 0).err(),
+            Some(NtHashError::SequenceTooShort { seq_len: 3, k: 4 })
+        );
     }
 }

@@ -21,8 +21,8 @@
 //! provides ergonomic traversal over valid k‑mers.
 
 use crate::{
-    constants::{CP_OFF, SEED_N, SEED_TAB},
-    tables::{srol, srol_table, sror},
+    constants::{ASCII_SIZE, CP_OFF, SEED_N, SEED_TAB},
+    tables::{srol, srol_table, sror, SROL_PERIOD},
     util::extend_hashes,
     NtHashError, Result,
 };
@@ -50,7 +50,7 @@ fn parse_seed_string(mask: &str, k: u16) -> Result<Vec<usize>> {
 }
 
 /// A base-indexed `[fwd, rev]` contribution table for one care position, used at
-/// a run boundary during rolling. Indexed by the raw base byte (256 entries).
+/// a run boundary during rolling. Indexed by the raw base byte.
 struct BoundaryTab {
     off: usize,
     tab: Vec<[u64; 2]>,
@@ -59,7 +59,7 @@ struct BoundaryTab {
 /// A single spaced seed: the care positions plus everything needed to both
 /// recompute a window from scratch and *roll* between windows.
 ///
-/// - `rot` — flattened `care.len() × 256` table `[fwd, rev]` for recomputing a
+/// - `rot` — flattened `care.len() × ASCII_SIZE` table `[fwd, rev]` for recomputing a
 ///   window from scratch (the O(#care) path, used at init and for seeds where
 ///   rolling doesn't pay).
 /// - `left` / `right` — the **run boundaries** of the care pattern: the only
@@ -79,39 +79,37 @@ struct SeedTab {
     rollable: bool,
 }
 
-/// Build a 256-entry `[srol_table(base, d_fwd), srol_table(base & CP, d_rev)]`
+/// Build the byte-indexed `[srol_table(base, d_fwd), srol_table(base & CP, d_rev)]`
 /// contribution table for one boundary position.
 fn boundary_tab(off: usize, d_fwd: u32, d_rev: u32) -> BoundaryTab {
-    let mut tab = vec![[0u64; 2]; 256];
-    for c in 0u32..256 {
-        tab[c as usize] = [
-            srol_table(c as u8, d_fwd),
-            srol_table((c as u8) & CP_OFF, d_rev),
-        ];
+    BoundaryTab {
+        off,
+        tab: contribution_tab(d_fwd, d_rev).collect(),
     }
-    BoundaryTab { off, tab }
+}
+
+/// The `[forward, reverse]` contribution of every byte value at one care
+/// position, given the split-rotate distances of that position on each strand.
+fn contribution_tab(d_fwd: u32, d_rev: u32) -> impl Iterator<Item = [u64; 2]> {
+    (0..ASCII_SIZE).map(move |c| {
+        let c = c as u8;
+        [srol_table(c, d_fwd), srol_table(c & CP_OFF, d_rev)]
+    })
 }
 
 /// Precompute the recompute and roll tables for one seed's care positions,
 /// which must be strictly increasing and `< k`.
 fn build_seed_tab(care: Vec<usize>, k: usize) -> SeedTab {
-    let mut rot = vec![[0u64; 2]; care.len() * 256];
-    for (i, &p) in care.iter().enumerate() {
-        let d_fwd = (k - 1 - p) as u32;
-        let d_rev = p as u32;
-        for c in 0u32..256 {
-            rot[i * 256 + c as usize] = [
-                srol_table(c as u8, d_fwd),
-                srol_table((c as u8) & CP_OFF, d_rev),
-            ];
-        }
-    }
+    let rot: Vec<[u64; 2]> = care
+        .iter()
+        .flat_map(|&p| contribution_tab((k - 1 - p) as u32, p as u32))
+        .collect();
 
     // Run boundaries: a forward slide turns `srol(fwd)`/`sror(rev)` of the old
     // hash into the new hash, except at care positions whose neighbour on one
     // side is *not* a care position — there the contribution must be corrected.
-    // `srol_table` has period lcm(31, 33) = 1023 in its rotation argument, so a
-    // rotation of `p - 1` at `p == 0` is taken mod 1023 (→ 1022).
+    // `srol_table` is periodic in its rotation argument, so the rotation of
+    // `p - 1` at `p == 0` (i.e. −1) is taken modulo that period.
     let mut in_care = vec![false; k];
     for &p in &care {
         in_care[p] = true;
@@ -121,7 +119,7 @@ fn build_seed_tab(care: Vec<usize>, k: usize) -> SeedTab {
     for &p in &care {
         if p == 0 || !in_care[p - 1] {
             // Base leaving the care coverage on a forward slide.
-            let d_rev = (p as i64 - 1).rem_euclid(1023) as u32;
+            let d_rev = (p as i64 - 1).rem_euclid(SROL_PERIOD as i64) as u32;
             left.push(boundary_tab(p, (k - p) as u32, d_rev));
         }
         if p + 1 == k || !in_care[p + 1] {
@@ -150,7 +148,7 @@ impl SeedTab {
         let mut n_invalid = 0usize;
         for (i, &p) in self.care.iter().enumerate() {
             let c = seq[pos + p] as usize;
-            let e = self.rot[i * 256 + c];
+            let e = self.rot[i * ASCII_SIZE + c];
             fwd ^= e[0];
             rev ^= e[1];
             if SEED_TAB[c] == SEED_N {
@@ -652,9 +650,8 @@ impl<'a> SeedNtHashIter<'a> {
     /// care position are skipped, mirroring the [`Iterator`].
     #[inline]
     pub fn for_each_hash<F: FnMut(usize, &[u64])>(mut self, mut f: F) {
-        if self.done {
-            return;
-        }
+        // An exhausted hasher keeps reporting `false`, so no `done` check is
+        // needed here.
         while self.hasher.roll() {
             f(self.hasher.pos(), self.hasher.hashes());
         }

@@ -1,17 +1,13 @@
 //! Miscellaneous helpers shared across all ntHash variants.
 //!
-//! This module provides two small yet critical building blocks used by
-//! every ntHash implementation (`NtHash`, `SeedNtHash`, `BlindNtHash`, etc.):
+//! This module provides the building blocks shared by every ntHash
+//! implementation in this crate:
 //!
 //! - **`canonical`** - combine forward and reverse‐complement hashes into a
 //!   strand‐independent value by wrapping addition.
 //! - **`extend_hashes`** - generate a sequence of "extra" hash values from
 //!   one canonical base hash, matching the C++ reference's multiplicative
 //!   mixing and shift scheme.
-//!
-//! These functions are marked `#[inline]` for zero‐overhead calls in hot paths,
-//! and the code is dependency‐free (only `core`/`std`), so it can be used
-//! in no‐std contexts if needed.
 
 use crate::constants::{MULTISEED, MULTISHIFT};
 

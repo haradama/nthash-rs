@@ -1,12 +1,10 @@
 //! Fuzz target: no `(seq, k, num_hashes, pos, mask)` may panic or hang.
 //!
-//! All three hashers are driven to completion over arbitrary bytes and
-//! arbitrary mask strings. Construction is allowed to fail (it returns a
-//! `Result`); what must never happen is a panic, an out-of-bounds slice, or a
-//! non-terminating roll. This is the campaign-grade counterpart to the
-//! `no_panic_*` property tests. It covers the backward (`roll_back`) and
-//! `peek*` entry points and unbounded minimizer windows as well as the forward
-//! pass.
+//! Every hasher is driven to completion over arbitrary bytes and arbitrary
+//! mask strings, through each of its entry points. Construction is allowed to
+//! fail (it returns a `Result`); what must never happen is a panic, an
+//! out-of-bounds slice, or a non-terminating roll. This is the campaign-grade
+//! counterpart to the `no_panic_*` property tests.
 
 #![no_main]
 

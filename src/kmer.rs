@@ -270,9 +270,9 @@ impl<'a> NtHash<'a> {
     /// materializing the hash buffer. Leaves the state untouched on failure.
     fn init_back(&mut self) -> bool {
         let k_usz = self.k as usize;
-        let mut pos = self.pos;
-        while pos > 0 {
-            pos -= 1;
+        // The caller only rolls back from a position past the start.
+        let mut pos = self.pos - 1;
+        loop {
             let Some(idx) = first_invalid_base(&self.seq[pos..pos + k_usz]) else {
                 self.set_window(pos);
                 self.update_hashes();
@@ -284,9 +284,8 @@ impl<'a> NtHash<'a> {
             if bad < k_usz {
                 return false;
             }
-            pos = bad - k_usz + 1; // decremented at the loop top
+            pos = bad - k_usz;
         }
-        false
     }
 
     /// Recompute the forward/reverse hashes from scratch for the (valid) window
@@ -529,8 +528,8 @@ pub struct NtHashIter<'a> {
 
 impl<'a> NtHashIter<'a> {
     /// Turn this into an iterator over `(pos, canonical_hash)` — one `u64` per
-    /// valid k‑mer and **no allocation**, several times faster than iterating
-    /// the `Vec`-yielding [`Iterator`] impl.
+    /// valid k‑mer and **no allocation**, unlike the `Vec`-yielding
+    /// [`Iterator`] impl.
     ///
     /// Like [`for_each_canonical`](Self::for_each_canonical), it ignores
     /// `num_hashes` and yields exactly the canonical hash (what `hashes()[0]`
@@ -572,9 +571,8 @@ impl<'a> NtHashIter<'a> {
     /// valid k‑mer **without allocating**.
     ///
     /// The [`Iterator`] impl yields an owned `Vec<u64>` per k‑mer, which means
-    /// one heap allocation for every window — the dominant cost when hashing
-    /// long sequences. This method instead lends the hasher's internal buffer
-    /// to `f`, so the whole traversal allocates nothing. Prefer it whenever the
+    /// one heap allocation for every window. This method instead lends the
+    /// hasher's internal buffer to `f`, so the whole traversal allocates nothing. Prefer it whenever the
     /// hashes are consumed immediately rather than collected.
     ///
     /// # Examples
@@ -590,9 +588,8 @@ impl<'a> NtHashIter<'a> {
     /// ```
     #[inline]
     pub fn for_each_hash<F: FnMut(usize, &[u64])>(mut self, mut f: F) {
-        if self.done {
-            return;
-        }
+        // An exhausted hasher keeps reporting `false`, so no `done` check is
+        // needed here.
         while self.hasher.roll() {
             f(self.hasher.pos(), self.hasher.hashes());
         }
@@ -609,20 +606,14 @@ impl<'a> NtHashIter<'a> {
     /// one hash per k‑mer suffices — e.g. minimizers, sketching, membership.
     #[inline]
     pub fn for_each_canonical<F: FnMut(usize, u64)>(mut self, mut f: F) {
-        if self.done {
-            return;
-        }
         let h = &mut self.hasher;
         let seq = h.seq;
         let k = h.k as usize;
-        let len = seq.len();
-        if len < k {
-            return;
-        }
-        let last = len - k; // last valid k-mer start index
+        let last = seq.len() - k; // last valid k-mer start index
 
         // Prime once: position on the first valid k-mer (or, for a hasher that
-        // was already rolled, step to the next one). This hoists the
+        // was already rolled, step to the next one — which also ends the
+        // traversal right here if it is exhausted). This hoists the
         // `initialized` check out of the hot loop below, leaving a tight roll
         // with each byte read exactly once.
         if !h.advance() {
@@ -750,3 +741,20 @@ impl Iterator for NtHashCanonicalIter<'_> {
 }
 
 impl std::iter::FusedIterator for NtHashCanonicalIter<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The canonical iterator resumes after an ambiguous base and, once it
+    /// has run out of k-mers, keeps returning `None`.
+    #[test]
+    fn canonical_iter_skips_n_and_fuses() {
+        let seq = b"ACGTNACGTA";
+        let mut it = NtHashBuilder::new(seq).k(4).finish().unwrap().canonical();
+        let positions: Vec<usize> = it.by_ref().map(|(pos, _)| pos).collect();
+        assert_eq!(positions, [0, 5, 6]);
+        assert_eq!(it.next(), None);
+        assert_eq!(it.size_hint(), (0, Some(0)));
+    }
+}

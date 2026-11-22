@@ -46,7 +46,7 @@ fn main() -> Result<(), NtHashError> {
 ```
 
 That iterator yields an owned `Vec<u64>` per k‑mer, which costs one allocation
-each. The allocation-free forms are several times faster:
+each. Prefer the allocation-free forms when the hashes are consumed on the spot:
 
 ```rust
 use nthash_rs::NtHashBuilder;

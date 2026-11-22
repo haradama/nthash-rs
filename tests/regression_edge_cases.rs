@@ -97,6 +97,22 @@ fn first_call_initializes_regardless_of_direction() {
     assert!(!h.roll_back());
 }
 
+/// The explicit-byte peeks follow the same rule: on a fresh hasher they only
+/// initialize, whatever byte they are handed.
+#[test]
+fn peek_char_on_fresh_hasher_initializes() {
+    let seq = b"ACGTTGCA";
+    let at2 = hash_of(&seq[2..6]);
+
+    let mut h = NtHash::new(seq, 4, 1, 2).unwrap();
+    assert!(h.peek_char(b'N'));
+    assert_eq!((h.pos(), h.hashes()[0]), (2, at2));
+
+    let mut h = NtHash::new(seq, 4, 1, 2).unwrap();
+    assert!(h.peek_back_char(b'N'));
+    assert_eq!((h.pos(), h.hashes()[0]), (2, at2));
+}
+
 /// Once initialized, `peek` shows the neighbouring k-mer without moving.
 #[test]
 fn peek_shows_neighbour_without_moving() {
@@ -110,10 +126,18 @@ fn peek_shows_neighbour_without_moving() {
 }
 
 /// `for_each_canonical` agrees with the iterator across `N`-skips, including a
-/// trailing `N` (the path that used to overshoot `pos`).
+/// trailing `N` (the path that used to overshoot `pos`), a sequence that ends
+/// on a valid k-mer, and one with no valid k-mer at all.
 #[test]
 fn for_each_canonical_handles_trailing_n() {
-    for seq in [&b"ACGTN"[..], b"ACGTNACGTAN", b"NNACGTANN", b"ACGTACGTNNN"] {
+    for seq in [
+        &b"ACGTN"[..],
+        b"ACGTNACGTAN",
+        b"NNACGTANN",
+        b"ACGTACGTNNN",
+        b"ACGTACGT",
+        b"NNNNN",
+    ] {
         let expected: Vec<(usize, u64)> = NtHashBuilder::new(seq)
             .k(4)
             .finish()
@@ -170,9 +194,74 @@ fn duplicate_care_indices_are_ignored() {
     assert_eq!(collect(vec![3, 1, 0, 2, 1]), clean);
 }
 
+/// An exhausted iterator stays exhausted, whichever way it is driven next.
+#[test]
+fn exhausted_iterators_stay_exhausted() {
+    let seq = b"ACGTNACGTA";
+
+    let drained = || {
+        let mut it = NtHashBuilder::new(seq).k(4).finish().unwrap();
+        assert_eq!(it.by_ref().count(), 3);
+        assert!(it.next().is_none());
+        it
+    };
+    let mut calls = 0;
+    drained().for_each_hash(|_, _| calls += 1);
+    drained().for_each_canonical(|_, _| calls += 1);
+    assert_eq!(calls, 0);
+    assert_eq!(drained().canonical().count(), 0);
+
+    let drained = || {
+        let mut it = SeedNtHashBuilder::new(seq)
+            .k(4)
+            .masks(["1011"])
+            .finish()
+            .unwrap();
+        assert!(it.by_ref().count() > 0);
+        assert!(it.next().is_none());
+        it
+    };
+    drained().for_each_hash(|_, _| calls += 1);
+    assert_eq!(calls, 0);
+}
+
 #[test]
 fn seed_errors_name_the_actual_problem() {
     let seq = b"ACGTACGT";
+    assert_eq!(
+        SeedNtHash::new(seq, &["1011"], 1, 0, 0).err(),
+        Some(NtHashError::InvalidK)
+    );
+    assert_eq!(
+        SeedNtHash::new(seq, &["1011"], 1, 4, 5).err(),
+        Some(NtHashError::PositionOutOfRange { pos: 5, seq_len: 8 })
+    );
+    assert_eq!(
+        SpacedSeeds::from_care_indices(vec![vec![0]], 0).err(),
+        Some(NtHashError::InvalidK)
+    );
+    // The builder surfaces mask errors instead of panicking.
+    assert_eq!(
+        SeedNtHashBuilder::new(seq)
+            .k(4)
+            .masks(["10x1"])
+            .finish()
+            .err(),
+        Some(NtHashError::InvalidMask)
+    );
+    // Sequence too short, through each way of supplying the seeds.
+    let too_short = Some(NtHashError::SequenceTooShort { seq_len: 3, k: 4 });
+    assert_eq!(
+        SeedNtHash::from_care_indices(b"ACG", vec![vec![0, 1]], 1, 4, 0).err(),
+        too_short
+    );
+    let seeds = SpacedSeeds::from_masks(&["1011"], 4).unwrap();
+    assert_eq!(
+        SeedNtHashBuilder::new(b"ACG").seeds(&seeds).finish().err(),
+        too_short
+    );
+    assert!(SpacedSeeds::from_masks(&[""; 0], 4).unwrap().is_empty());
+    assert!(!SpacedSeeds::from_masks(&["1011"], 4).unwrap().is_empty());
     assert_eq!(
         SeedNtHash::new(seq, &["101"], 1, 4, 0).err(),
         Some(NtHashError::InvalidMaskLength { mask_len: 3, k: 4 })
@@ -237,6 +326,34 @@ fn shared_seeds_match_owned_masks() {
         SeedNtHash::with_seeds(b"ACG", &seeds, 1, 0).err(),
         Some(NtHashError::SequenceTooShort { seq_len: 3, k: 6 })
     );
+}
+
+/// The blind builder reports an invalid configuration instead of panicking,
+/// and its callback traversals continue from a partially consumed iterator.
+#[test]
+fn blind_builder_errors_and_resumes() {
+    assert_eq!(
+        BlindNtHashBuilder::new(b"ACG").k(4).finish().err(),
+        Some(NtHashError::SequenceTooShort { seq_len: 3, k: 4 })
+    );
+
+    let seq = b"ACGTTGCATG";
+    let iter = || BlindNtHashBuilder::new(seq).k(4).finish().unwrap();
+    let full: Vec<(usize, u64)> = iter().map(|(p, h)| (p, h[0])).collect();
+
+    // Each traversal is driven from a fresh iterator and from one that has
+    // already yielded `taken` items.
+    for taken in [0, 3] {
+        let mut it = iter();
+        let mut got: Vec<(usize, u64)> = it.by_ref().take(taken).map(|(p, h)| (p, h[0])).collect();
+        it.for_each_hash(|p, h| got.push((p, h[0])));
+        assert_eq!(got, full, "for_each_hash after {taken}");
+
+        let mut it = iter();
+        let mut got: Vec<(usize, u64)> = it.by_ref().take(taken).map(|(p, h)| (p, h[0])).collect();
+        it.for_each_canonical(|p, h| got.push((p, h)));
+        assert_eq!(got, full, "for_each_canonical after {taken}");
+    }
 }
 
 #[test]

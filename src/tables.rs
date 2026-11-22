@@ -7,10 +7,16 @@
 //! (`srol_table`) that applies a split‑rotate to a pre‑seeded constant
 //! (A/C/G/T/N) and supports arbitrary rotation distances without branches.
 //!
-//! All functions are marked `#[inline(always)]` for maximum performance - each
-//! compiles down to a handful of shifts, masks, and table lookups.
+//! On top of those primitives sit the per-`k` constant tables the hashers roll
+//! with: [`RollConsts`] for input gated to valid bases, and [`build_srol_k`]
+//! for input that may contain arbitrary bytes.
 
-use crate::constants::{CP_OFF, MS_TAB_31L, MS_TAB_33R, SEED_TAB};
+use crate::constants::{ASCII_SIZE, CP_OFF, MS_TAB_31L, MS_TAB_33R, SEED_N, SEED_TAB};
+
+/// Period of [`srol_table`] in its rotation argument: the two halves rotate
+/// independently with the lengths of their tables, which are coprime, so the
+/// pair repeats after the product of those lengths.
+pub const SROL_PERIOD: u32 = (MS_TAB_31L[0].len() * MS_TAB_33R[0].len()) as u32;
 
 /// One‑bit split‑rotate left (33 + 31 bit halves).
 ///
@@ -74,36 +80,33 @@ pub const fn sror(x: u64) -> u64 {
 /// This avoids any runtime loops or branching in the hot path.
 #[inline(always)]
 pub fn srol_table(c: u8, d: u32) -> u64 {
-    let idx31 = (d % 31) as usize;
-    let idx33 = (d % 33) as usize;
-    MS_TAB_31L[c as usize][idx31] | MS_TAB_33R[c as usize][idx33]
+    let tab31 = MS_TAB_31L[c as usize];
+    let tab33 = MS_TAB_33R[c as usize];
+    tab31[d as usize % tab31.len()] | tab33[d as usize % tab33.len()]
 }
 
-/// The only byte values whose split-rotate tables are non-zero: A/C/G/T (upper
-/// and lower case), RNA `U`, and the low indices produced by `byte & CP_OFF`.
-/// Every other byte selects the all-zero `N` tables, so `srol_table(c, k) == 0`.
-const SROL_NONZERO_BYTES: [u8; 15] = [
-    b'A', b'a', b'C', b'c', b'G', b'g', b'T', b't', b'U', b'u', 1, 3, 4, 5, 7,
-];
-
-/// Precompute `srol_table(c, k)` for every byte `c` into a 256-entry table.
+/// Precompute `srol_table(c, k)` for every byte value `c`.
 ///
 /// Used by [`BlindNtHash`](crate::blind), which — unlike [`NtHash`](crate::kmer)
 /// — does not skip ambiguous bases: it hashes whatever it is fed, and the
-/// reference defines an `N` (or any non-ACGT byte) as a zero contribution. A
-/// full byte-indexed table preserves that, where the 4-constant [`RollConsts`]
-/// (which folds `N` into `G`) cannot. Only the ~15 meaningful bytes are
-/// computed; the rest stay `0`, which is exactly `srol_table(c, k)` for them. A
-/// debug assertion guards that the shortcut stays in sync with `MS_TAB_*`.
-pub fn build_srol_k(k: u16) -> Box<[u64; 256]> {
+/// reference defines an `N` (or any other non-base byte) as a zero
+/// contribution. A full byte-indexed table preserves that, where
+/// [`RollConsts`] (which folds `N` onto `G`) cannot.
+///
+/// Only bytes with a non-zero seed are computed. Every other byte selects the
+/// all-zero `N` tables, so its entry stays `0`, which is exactly
+/// `srol_table(c, k)` for it.
+pub fn build_srol_k(k: u16) -> Box<[u64; ASCII_SIZE]> {
     let d = k as u32;
-    let mut t = Box::new([0u64; 256]);
-    for &c in &SROL_NONZERO_BYTES {
-        t[c as usize] = srol_table(c, d);
+    let mut t = Box::new([0u64; ASCII_SIZE]);
+    for (c, slot) in t.iter_mut().enumerate() {
+        if SEED_TAB[c] != SEED_N {
+            *slot = srol_table(c as u8, d);
+        }
     }
     debug_assert!(
-        (0..256).all(|c| t[c] == srol_table(c as u8, d)),
-        "SROL_NONZERO_BYTES is out of sync with MS_TAB_*"
+        (0..ASCII_SIZE).all(|c| t[c] == srol_table(c as u8, d)),
+        "SEED_TAB and MS_TAB_* disagree on which bytes are bases"
     );
     t
 }
@@ -124,16 +127,16 @@ pub fn base_code(b: u8) -> usize {
 
 /// Per-base rolling constants for a fixed `k`, indexed by [`base_code`].
 ///
-/// Supersedes the 256-entry `srol_k` table: only four distinct base
-/// contributions exist, so four constants per table are selected by the 2-bit
-/// code. This is measurably faster in the roll hot-path than a variable-index
-/// load into a 2 KiB table, and — unlike the table — needs no heap allocation,
-/// which matters when a fresh hasher is built per short read.
+/// Input gated to valid bases has one distinct contribution per nucleotide, so
+/// each table holds one constant per 2-bit code instead of one per byte value
+/// as [`build_srol_k`] does. That keeps the constants small enough to live
+/// inline in the hasher — no heap allocation, which matters when a fresh
+/// hasher is built per short read.
 ///
-/// The forward roll additionally gets two *merged* 16-entry tables
-/// (`next_fwd` / `next_rev`), indexed by [`roll_index`](Self::roll_index), that
-/// fold the outgoing and incoming contributions into a single lookup and XOR
-/// per strand. The per-base tables remain for the backward roll.
+/// The forward roll additionally gets *merged* tables (`next_fwd` /
+/// `next_rev`), indexed by [`roll_index`](Self::roll_index) with one entry per
+/// (outgoing, incoming) pair, that fold both contributions into a single
+/// lookup and XOR per strand. The per-base tables remain for the backward roll.
 #[derive(Clone)]
 pub struct RollConsts {
     /// `SEED_TAB[base]` — forward incoming contribution.
@@ -155,7 +158,7 @@ pub struct RollConsts {
 }
 
 impl RollConsts {
-    /// Precompute the four per-base constants for k-mer length `k`.
+    /// Precompute the per-base constants for k-mer length `k`.
     pub fn new(k: u16) -> Self {
         let mut c = RollConsts {
             seed: [0; 4],
@@ -373,7 +376,7 @@ mod tests {
         assert_eq!(srol_table(0, 33), 0x0000_0000_0000_0000);
     }
 
-    /// The merged forward-roll tables must reproduce the textbook two-lookup
+    /// The merged forward-roll tables must reproduce the textbook per-base
     /// update for every (outgoing, incoming) base pair, in either case.
     #[test]
     fn merged_roll_matches_per_base_update() {
@@ -390,6 +393,20 @@ mod tests {
                     );
                     assert_eq!(c.roll(fwd, rev, out, inc), (want_fwd, want_rev), "k={k}");
                 }
+            }
+        }
+    }
+
+    /// `SROL_PERIOD` is the period of `srol_table` in its rotation argument,
+    /// and no proper divisor of it is.
+    #[test]
+    fn srol_table_period() {
+        for &c in b"ACGT" {
+            for d in 0..SROL_PERIOD {
+                assert_eq!(srol_table(c, d), srol_table(c, d + SROL_PERIOD));
+            }
+            for p in (1..SROL_PERIOD).filter(|&p| SROL_PERIOD.is_multiple_of(p)) {
+                assert!((0..p).any(|d| srol_table(c, d) != srol_table(c, d + p)));
             }
         }
     }

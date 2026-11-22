@@ -1,31 +1,27 @@
 //! Property-based tests encoding the mathematical invariants of ntHash.
 //!
 //! Unlike the golden-vector regression tests (which anchor the lookup tables to
-//! the C++ reference on a handful of fixed inputs), these tests assert
-//! *structural* properties that must hold for **every** input. They are an
-//! oracle-free correctness net: they caught nothing to write home about on
-//! their own, but they make whole classes of future regressions impossible to
-//! merge — including the two bugs fixed alongside them
-//! (`SeedNtHash` stopping at `N`, `BlindNtHash` panicking on short input).
+//! the C++ reference on fixed inputs), these tests assert *structural*
+//! properties that must hold for **every** input. They are an oracle-free
+//! correctness net: no reference implementation is needed to run them.
 //!
-//! The five invariants:
-//! 1. **Purity** — a k-mer's hash depends only on its bases, not its position
-//!    or neighbours (rolling hash == isolated recomputation).
-//! 2. **Reverse-complement invariance** — the canonical hash is identical for a
-//!    k-mer and its reverse complement (the defining property of ntHash).
-//! 3. **Strand symmetry** — `forward(kmer) == reverse(revcomp(kmer))`.
-//! 4. **Roll invertibility** — `roll` then `roll_back` restores the state.
-//! 5. **Cross-variant agreement** — `NtHash`, `BlindNtHash`, and an all-ones
-//!    `SeedNtHash` compute the same values.
-//!
-//! A sixth test asserts **robustness**: no `(seq, k, pos, mask)` — however
-//! malformed — may panic.
+//! The invariants fall into these groups:
+//! - **Purity** — a k-mer's hash depends only on its bases, not its position
+//!   or neighbours (rolling hash == isolated recomputation).
+//! - **Reverse-complement invariance** — the canonical hash is identical for a
+//!   k-mer and its reverse complement (the defining property of ntHash).
+//! - **Strand symmetry** — `forward(kmer) == reverse(revcomp(kmer))`.
+//! - **Roll invertibility** — rolling back retraces the forward pass, and
+//!   peeking agrees with rolling.
+//! - **Cross-variant agreement** — the hashers, iterators and callback paths
+//!   that can express the same computation produce the same values.
+//! - **Robustness** — no input, however malformed, may panic.
 
 use nthash_rs::{
     canonical,
     kmer::{base_forward_hash, base_reverse_hash},
     BlindNtHash, BlindNtHashBuilder, MinimizerBuilder, NtHash, NtHashBuilder, ReadHasher,
-    SeedNtHash, SpacedSeeds,
+    SeedNtHash, SeedNtHashBuilder, SpacedSeeds,
 };
 use proptest::prelude::*;
 use std::collections::{BTreeMap, HashSet};
@@ -143,7 +139,7 @@ proptest! {
             .filter_map(|(i, b)| if b == b'1' { Some(i) } else { None })
             .collect();
 
-        let got: Vec<(usize, Vec<u64>)> = nthash_rs::SeedNtHashBuilder::new(&seq)
+        let got: Vec<(usize, Vec<u64>)> = SeedNtHashBuilder::new(&seq)
             .k(k as u16)
             .masks(vec![mask])
             .num_hashes(m)
@@ -153,7 +149,7 @@ proptest! {
         prop_assert_eq!(got, brute_seed(&seq, &care, k, m));
     }
 
-    /// (1) The rolling forward/reverse hash of each window equals the hash of
+    /// The rolling forward/reverse hash of each window equals the hash of
     /// that window computed in isolation — the hash is a pure function of the
     /// k-mer, independent of position and surrounding bases.
     #[test]
@@ -166,9 +162,9 @@ proptest! {
         }
     }
 
-    /// (1b) Purity holds across `N`-skips too: after `NtHash` resumes past an
+    /// Purity holds across `N`-skips too: after `NtHash` resumes past an
     /// ambiguous base, each emitted window still equals its isolated hash. This
-    /// guards the 4-constant roll path, which folds `N` onto `G` and so relies
+    /// guards the base-code roll path, which folds `N` onto `G` and so relies
     /// on `N` being gated out of the roll body.
     #[test]
     fn purity_with_n(
@@ -220,7 +216,7 @@ proptest! {
         prop_assert_eq!(fast, general);
     }
 
-    /// (2) The canonical hash is invariant under reverse complement, and (3)
+    /// The canonical hash is invariant under reverse complement, and the
     /// forward/reverse hashes swap under reverse complement (strand symmetry).
     #[test]
     fn reverse_complement_symmetry((seq, k) in seq_and_k()) {
@@ -268,7 +264,7 @@ proptest! {
         prop_assert_eq!(it.collect::<Vec<_>>(), expected);
     }
 
-    /// (4) Rolling forward then back returns to exactly the prior hashes.
+    /// Rolling forward then back returns to exactly the prior hashes.
     #[test]
     fn roll_back_inverts_roll((seq, k) in seq_and_k()) {
         // Need at least two windows to exercise a forward+back cycle.
@@ -283,7 +279,7 @@ proptest! {
         prop_assert_eq!(h.reverse_hash(), r0);
     }
 
-    /// (4b) Rolling back from the end visits exactly the valid k-mers the forward
+    /// Rolling back from the end visits exactly the valid k-mers the forward
     /// pass visited, in reverse, with identical hashes — including across `N`s.
     #[test]
     fn roll_back_retraces_forward_pass(
@@ -313,7 +309,7 @@ proptest! {
         prop_assert_eq!(back, fwd);
     }
 
-    /// (4c) `peek` / `peek_back` report the hashes the next `roll` /
+    /// `peek` / `peek_back` report the hashes the next `roll` /
     /// `roll_back` would produce whenever that step is a plain one-base slide,
     /// and never move the window.
     #[test]
@@ -378,7 +374,133 @@ proptest! {
         prop_assert_eq!(&shared, &expected);
     }
 
-    /// (5a) `NtHash` and `BlindNtHash` agree on every window of an N-free input.
+    /// `BlindNtHash` is exactly invertible and its peeks agree with its rolls:
+    /// from any window, stepping either way lands on the state a hasher built
+    /// directly on the neighbouring window has, and peeking shows that
+    /// neighbour's hashes without moving.
+    #[test]
+    fn blind_roll_back_and_peek_agree_with_roll(
+        (seq, k) in seq_and_k(),
+        num_hashes in 1u8..4,
+        start in any::<prop::sample::Index>(),
+    ) {
+        let ku = k as usize;
+        let last = seq.len() - ku;
+        let pos = start.index(last + 1);
+        let at = |p: usize| BlindNtHash::new(&seq, k, num_hashes, p).unwrap();
+        let state = |h: &BlindNtHash| (h.pos(), h.forward_hash(), h.reverse_hash());
+
+        if pos < last {
+            let next = at(pos + 1);
+            let incoming = seq[pos + ku];
+
+            let mut h = at(pos);
+            h.peek(incoming);
+            prop_assert_eq!(h.hashes(), next.hashes());
+            prop_assert_eq!(state(&h), state(&at(pos)), "peek must not move");
+
+            prop_assert!(h.roll(incoming));
+            prop_assert_eq!(state(&h), state(&next));
+            prop_assert_eq!(h.hashes(), next.hashes());
+
+            // ...and back again.
+            prop_assert!(h.roll_back(seq[pos]));
+            prop_assert_eq!(state(&h), state(&at(pos)));
+            let origin = at(pos);
+            prop_assert_eq!(h.hashes(), origin.hashes());
+        }
+        if pos > 0 {
+            let prev = at(pos - 1);
+            let incoming = seq[pos - 1];
+
+            let mut h = at(pos);
+            h.peek_back(incoming);
+            prop_assert_eq!(h.hashes(), prev.hashes());
+            prop_assert_eq!(state(&h), state(&at(pos)), "peek_back must not move");
+
+            prop_assert!(h.roll_back(incoming));
+            prop_assert_eq!(state(&h), state(&prev));
+            prop_assert_eq!(h.hashes(), prev.hashes());
+        }
+    }
+
+    /// `canonical()` continues from wherever the general iterator stopped: the
+    /// two halves together are exactly the full traversal, for any split point
+    /// (including before the first and after the last k-mer).
+    #[test]
+    fn canonical_resumes_a_partially_consumed_iterator(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..120),
+        k in 1u16..10,
+        taken in 0usize..130,
+    ) {
+        prop_assume!(seq.len() >= k as usize);
+        let full: Vec<(usize, u64)> = NtHashBuilder::new(&seq).k(k).finish().unwrap()
+            .map(|(p, h)| (p, h[0]))
+            .collect();
+
+        let mut it = NtHashBuilder::new(&seq).k(k).finish().unwrap();
+        let mut got: Vec<(usize, u64)> = Vec::new();
+        for _ in 0..taken {
+            match it.next() {
+                Some((p, h)) => got.push((p, h[0])),
+                None => break,
+            }
+        }
+        let mut rest = it.canonical();
+        let upper = rest.size_hint().1.unwrap();
+        let before = got.len();
+        got.extend(&mut rest);
+        prop_assert!(got.len() - before <= upper);
+        prop_assert_eq!(got, full);
+
+        // Once exhausted it stays exhausted.
+        prop_assert_eq!(rest.next(), None);
+        prop_assert_eq!(rest.size_hint(), (0, Some(0)));
+    }
+
+    /// The spaced-seed callback traversal lends exactly what the iterator
+    /// yields, from any start position.
+    #[test]
+    fn seed_for_each_hash_matches_iterator(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..150),
+        mask_bits in prop::collection::vec(prop::sample::select(&b"01"[..]), 1..16),
+        num_hashes in 1usize..4,
+        start in any::<prop::sample::Index>(),
+    ) {
+        let k = mask_bits.len();
+        prop_assume!(seq.len() >= k);
+        let mask = String::from_utf8(mask_bits).unwrap();
+        let pos = start.index(seq.len() - k + 1);
+        let iter = || SeedNtHashBuilder::new(&seq)
+            .k(k as u16)
+            .masks([mask.as_str()])
+            .num_hashes(num_hashes)
+            .pos(pos)
+            .finish()
+            .unwrap();
+
+        let mut got = Vec::new();
+        iter().for_each_hash(|p, h| got.push((p, h.to_vec())));
+        let expected: Vec<(usize, Vec<u64>)> = iter().collect();
+        prop_assert!(expected.iter().all(|(p, _)| *p >= pos));
+        prop_assert_eq!(got, expected);
+    }
+
+    /// `Minimizers::for_each` selects exactly what the iterator yields.
+    #[test]
+    fn minimizer_for_each_matches_iterator(
+        seq in prop::collection::vec(prop::sample::select(&b"ACGTN"[..]), 1..200),
+        k in 1u16..12,
+        w in 1usize..8,
+    ) {
+        prop_assume!(seq.len() >= k as usize);
+        let mins = || MinimizerBuilder::new(&seq).k(k).w(w).finish().unwrap();
+        let mut got = Vec::new();
+        mins().for_each(|m| got.push(m));
+        prop_assert_eq!(got, mins().collect::<Vec<_>>());
+    }
+
+    /// `NtHash` and `BlindNtHash` agree on every window of an N-free input.
     #[test]
     fn nthash_agrees_with_blind((seq, k) in seq_and_k()) {
         let mut nt = NtHash::new(&seq, k, 1, 0).unwrap();
@@ -396,7 +518,7 @@ proptest! {
         }
     }
 
-    /// (5b) An all-ones spaced seed reproduces `NtHash`'s canonical hash.
+    /// An all-ones spaced seed reproduces `NtHash`'s canonical hash.
     #[test]
     fn seed_all_ones_equals_nthash((seq, k) in seq_and_k()) {
         let mask = "1".repeat(k as usize);
@@ -481,7 +603,7 @@ proptest! {
     /// Robustness: arbitrary bytes / k / pos / num_hashes must never panic —
     /// construction either errors cleanly or yields a hasher that rolls to
     /// completion. This is a proptest stand-in for fuzzing that runs in normal
-    /// CI; it fails on the `BlindNtHash` short-input panic fixed today.
+    /// CI.
     #[test]
     fn no_panic_on_arbitrary_input(
         seq in prop::collection::vec(any::<u8>(), 0..300),

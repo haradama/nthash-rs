@@ -1,6 +1,6 @@
 # Correctness strategy
 
-`nthash-rs` is validated on three independent layers. Together they pin the
+`nthash-rs` is validated on independent layers. Together they pin the
 output to the C++ reference *and* prove structural correctness on every input.
 
 ## 1. Golden vectors (absolute correctness vs. the C++ reference)
@@ -48,14 +48,14 @@ inputs, so they cannot be satisfied by an accidental constant:
 | `roll_back` from the end retraces the forward pass (with `N`) | backward `N`-skipping visits the same k-mers and terminates |
 | `peek` / `peek_back` == the neighbouring k-mer's hashes | peeking is consistent with rolling and does not move the window |
 | care indices behave as a set; shared `SpacedSeeds` == per-hasher masks | seed precompilation is input-order independent and reusable |
-| `NtHash` == `BlindNtHash`; all-ones `SeedNtHash` == `NtHash` | the three code paths agree |
+| `NtHash` == `BlindNtHash`; all-ones `SeedNtHash` == `NtHash` | the independent code paths agree |
 
 These are an *oracle-free* net: no reference implementation is needed to run
 them, so they gate every PR in ordinary CI.
 
 ## 3. Fuzzing (robustness — no panics, no hangs)
 
-`../fuzz/` holds a `cargo-fuzz` target driving all three hashers over arbitrary
+`../fuzz/` holds a `cargo-fuzz` target driving every hasher over arbitrary
 bytes, `k`, `pos`, and mask strings. Construction may return `Err`, but a panic,
 an out-of-bounds slice, or a non-terminating roll is a bug.
 
@@ -67,6 +67,21 @@ CI build-checks the target on every push (`fuzz-build` job) so it can't rot; run
 campaigns out-of-band before releases. The `no_panic_*` cases in `properties.rs`
 are a lightweight stand-in that runs in normal CI.
 
-> Both bugs fixed in the change that introduced these tests — `SeedNtHash`
-> silently stopping at the first `N`, and `BlindNtHash` panicking on a sequence
-> shorter than `k` — are now covered by layers 2 and 3.
+## Coverage
+
+CI requires the unit, property and regression tests together to execute every
+line of the library (the `coverage` job). To check locally:
+
+```bash
+cargo install cargo-llvm-cov        # needs the llvm-tools-preview component
+cargo llvm-cov --fail-under-lines 100 --show-missing-lines
+```
+
+Two things to know when the gate fails without listing a missed line:
+
+- A generic function is measured per instantiation, and the summary takes the
+  best single one. A method taking a closure therefore needs *one* call site
+  that reaches all of its lines; covering the halves from different call sites
+  does not count.
+- Code that cannot be reached is a finding in itself: remove it rather than
+  excluding it from the report.

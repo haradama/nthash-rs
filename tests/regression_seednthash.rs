@@ -154,7 +154,7 @@ fn regression_simple_seednthash() {
         let window = &seq[*pos..*pos + k_usize];
         assert_eq!(window, expected_kmers[i], "window at pos {}", pos);
 
-        // check the three hash values
+        // check every hash value
         assert_eq!(
             hashes.as_slice(),
             &expected_hashes[i][..],
