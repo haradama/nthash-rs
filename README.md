@@ -7,6 +7,8 @@
 
 Pure‑Rust port of the [ntHash](https://github.com/bcgsc/ntHash) rolling‑hash suite for DNA sequences, bit‑compatible with the C++ reference.
 
+Compatibility is checked, not assumed: the test suite compares `NtHash`, `BlindNtHash` and `SeedNtHash` against vectors generated from the C++ library, and CI regenerates those vectors from a pinned commit of the reference on every run. The few inputs on which the reference has no well-defined output (for example `k < 3`, or spaced seeds over a sequence containing `N`) are listed in [tests/README.md](tests/README.md).
+
 | Type | Use it for |
 |---|---|
 | `NtHash` / `NtHashBuilder` | contiguous k‑mers; windows containing `N` (or any other non‑ACGTU byte) are skipped |

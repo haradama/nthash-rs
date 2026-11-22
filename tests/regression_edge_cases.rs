@@ -356,6 +356,40 @@ fn blind_builder_errors_and_resumes() {
     }
 }
 
+/// `k == 0` is rejected by every constructor.
+#[test]
+fn zero_k_is_rejected_everywhere() {
+    let seq = b"ACGTACGT";
+    let invalid_k = Some(NtHashError::InvalidK);
+    assert_eq!(NtHash::new(seq, 0, 1, 0).err(), invalid_k);
+    assert_eq!(NtHashBuilder::new(seq).finish().err(), invalid_k);
+    assert_eq!(BlindNtHash::new(seq, 0, 1, 0).err(), invalid_k);
+    assert_eq!(BlindNtHashBuilder::new(seq).finish().err(), invalid_k);
+    assert_eq!(ReadHasher::new(0).err(), invalid_k);
+    assert_eq!(MinimizerBuilder::new(seq).w(3).finish().err(), invalid_k);
+    assert_eq!(
+        SeedNtHashBuilder::new(seq).masks(["1"]).finish().err(),
+        invalid_k
+    );
+}
+
+/// A start position past the last k-mer is rejected by every constructor.
+#[test]
+fn start_position_out_of_range_is_rejected() {
+    let seq = b"ACGTACGT";
+    let out_of_range = Some(NtHashError::PositionOutOfRange { pos: 5, seq_len: 8 });
+    assert_eq!(NtHash::new(seq, 4, 1, 5).err(), out_of_range);
+    assert_eq!(
+        NtHashBuilder::new(seq).k(4).pos(5).finish().err(),
+        out_of_range
+    );
+    assert_eq!(
+        BlindNtHashBuilder::new(seq).k(4).pos(5).finish().err(),
+        out_of_range
+    );
+    assert!(NtHash::new(seq, 4, 1, 4).is_ok());
+}
+
 #[test]
 fn blind_position_out_of_range_is_reported_as_given() {
     assert_eq!(

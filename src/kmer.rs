@@ -371,7 +371,7 @@ pub fn base_forward_hash(seq: &[u8], k: u16) -> u64 {
     let k = k as usize;
     let mut h = 0_u64;
 
-    for chunk in seq[..k - k % 4].chunks_exact(4) {
+    for chunk in seq[..k].as_chunks::<4>().0 {
         h = srol_n(h, 4);
 
         // build 0‑255 index with 8‑bit wrapping

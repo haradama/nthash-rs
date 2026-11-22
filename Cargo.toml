@@ -6,7 +6,6 @@ description      = "Pure‑Rust port of the ntHash rolling hash for DNA: contigu
 license          = "MIT"
 repository       = "https://github.com/haradama/nthash-rs"
 documentation    = "https://docs.rs/nthash-rs"
-homepage         = "https://github.com/haradama/nthash-rs"
 keywords         = ["bioinformatics", "k-mer", "dna", "hash", "rolling-hash"]
 categories       = ["science::bioinformatics::genomics", "science::bioinformatics::sequence-analysis"]
 authors          = ["haradama <harada@sfc.wide.ad.jp>"]

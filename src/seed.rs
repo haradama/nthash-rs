@@ -475,6 +475,11 @@ impl<'a> SeedNtHash<'a> {
     /// (the position advances to the next valid k-mer), matching the behaviour
     /// of the contiguous [`NtHash`](crate::kmer::NtHash). `false` is returned
     /// only when the end of the sequence is reached.
+    ///
+    /// This is the one place where the output differs from the C++ reference,
+    /// whose handling of ambiguous bases under a spaced seed depends on where
+    /// in the window the base sits. On input without ambiguous bases the two
+    /// agree bit for bit.
     pub fn roll(&mut self) -> bool {
         let last = self.seq.len() - self.k;
         if !self.initialized {

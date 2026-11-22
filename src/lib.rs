@@ -1,7 +1,12 @@
 //! # ntHash‑rs
 //!
 //! An idiomatic, pure‑Rust port of the *ntHash* rolling‑hash suite for DNA
-//! sequences, bit‑compatible with the C++ reference.
+//! sequences, bit‑compatible with the C++ reference
+//! ([bcgsc/ntHash](https://github.com/bcgsc/ntHash)): the test suite compares
+//! [`NtHash`], [`BlindNtHash`] and [`SeedNtHash`] against vectors generated
+//! from the C++ library. Inputs on which the reference has no well-defined
+//! output — `k < 3`, or spaced seeds over a sequence containing `N` — are the
+//! exception; see `tests/README.md` in the repository.
 //!
 //! | Type | Use it for |
 //! |---|---|

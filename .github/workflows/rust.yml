@@ -40,7 +40,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Line coverage (must be complete)
+        # Measure unoptimized code. The dev profile is built at opt-level 1,
+        # where the optimizer instruments the same function differently in
+        # each test binary; such profiles cannot be merged and are dropped.
+        env:
+          CARGO_PROFILE_DEV_OPT_LEVEL: 0
+          CARGO_PROFILE_TEST_OPT_LEVEL: 0
         run: cargo llvm-cov --fail-under-lines 100 --show-missing-lines
+
+  # The committed reference vectors must be exactly what the C++ reference
+  # produces: rebuild it at the pinned commit and compare.
+  reference:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate vectors from the C++ reference and compare
+        run: tests/reference/generate.sh --check
 
   # Build the cargo-fuzz targets so they can't silently rot. Running an actual
   # campaign happens out-of-band; here we only prove the harness compiles.

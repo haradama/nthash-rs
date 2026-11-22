@@ -165,31 +165,40 @@ mod tests {
         }
     }
 
+    /// Hash `reads` and report the outcome together with how many k-mers were
+    /// emitted.
+    fn outcome(k: u16, reads: &[&[u8]]) -> (Result<()>, usize) {
+        let mut calls = 0;
+        let res = ReadHasher::new(k)
+            .unwrap()
+            .hash_reads(reads, |_, _, _| calls += 1);
+        (res, calls)
+    }
+
     /// A read shorter than `k` is rejected with the same error `NtHash::new`
     /// gives, before anything is emitted — even for reads ahead of it.
     #[test]
     fn read_shorter_than_k_errors_before_emitting() {
+        let too_short = NtHashError::SequenceTooShort { seq_len: 3, k: 5 };
         let reads: &[&[u8]] = &[b"ACGTAC", b"TTGGCC", b"ACG", b""];
-        let mut calls = 0;
-        let res = ReadHasher::new(5)
-            .unwrap()
-            .hash_reads(reads, |_, _, _| calls += 1);
-        assert_eq!(res, Err(NtHashError::SequenceTooShort { seq_len: 3, k: 5 }));
-        assert_eq!(calls, 0);
+        assert_eq!(outcome(5, reads), (Err(too_short.clone()), 0));
         assert_eq!(
             crate::NtHash::new(b"ACG", 5, 1, 0).err(),
-            res.err(),
+            Some(too_short),
             "batch and single-sequence hashers must agree"
         );
+        // Without the short reads the batch is accepted and fully emitted.
+        assert_eq!(outcome(5, &reads[..2]), (Ok(()), 4));
     }
 
     #[test]
     fn empty_batch_ok() {
-        let mut calls = 0;
-        let res = ReadHasher::new(4)
-            .unwrap()
-            .hash_reads::<&[u8], _>(&[], |_, _, _| calls += 1);
-        assert_eq!((res, calls), (Ok(()), 0));
+        assert_eq!(outcome(4, &[]), (Ok(()), 0));
+    }
+
+    #[test]
+    fn zero_k_is_rejected() {
+        assert_eq!(ReadHasher::new(0).err(), Some(NtHashError::InvalidK));
     }
 
     /// Calls arrive ordered by read, then by position within the read.
